@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use log::*;
 
+mod checkpoint;
+pub use checkpoint::Checkpoint;
+
 /** A data structure to keep track of equalities between expressions.
 
 Check out the [background tutorial](crate::tutorials::_01_background)
@@ -83,6 +86,10 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     /// [`EGraph::classes_mut`], and after deserializing (the index is not serialized).
     #[cfg_attr(feature = "serde-1", serde(skip, default = "default_reindex_all"))]
     reindex_all: bool,
+    /// How to undo the changes made since each open [`Checkpoint`]; `None` while no
+    /// checkpoint is open.
+    #[cfg_attr(feature = "serde-1", serde(skip, default = "no_trail"))]
+    trail: Option<Box<checkpoint::Trail<L, N::Data>>>,
     #[cfg_attr(
         feature = "serde-1",
         serde(bound(
@@ -113,6 +120,11 @@ fn default_classes_by_op<K>() -> HashMap<K, HashSet<Id>> {
 #[cfg(feature = "serde-1")]
 fn default_reindex_all() -> bool {
     true
+}
+
+#[cfg(feature = "serde-1")]
+fn no_trail<T>() -> Option<T> {
+    None
 }
 
 impl<L: Language, N: Analysis<L> + Default> Default for EGraph<L, N> {
@@ -147,6 +159,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             dirty: Default::default(),
             unindexed: Default::default(),
             reindex_all: false,
+            trail: None,
             classes_by_op: Default::default(),
             union_log: Default::default(),
         }
@@ -163,6 +176,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// have changed any class's nodes.
     pub fn classes_mut(&mut self) -> impl ExactSizeIterator<Item = &mut EClass<L, N::Data>> {
         self.reindex_all = true;
+        if let Some(trail) = &mut self.trail {
+            self.classes.values().for_each(|class| trail.class(class));
+        }
         self.classes.values_mut()
     }
 
@@ -687,6 +703,7 @@ where
                 })
                 .collect(),
             reindex_all: src_egraph.reindex_all,
+            trail: None,
             classes: src_egraph
                 .classes
                 .into_iter()
@@ -855,6 +872,9 @@ impl<L: Language, N: Analysis<L>> std::ops::IndexMut<Id> for EGraph<L, N> {
             .classes
             .get_mut(&id)
             .unwrap_or_else(|| panic!("Invalid id {}", id));
+        if let Some(trail) = &mut self.trail {
+            trail.class(class);
+        }
         if !self.unindexed.contains_key(&id) {
             self.unindexed
                 .insert(id, distinct_ops(&class.nodes).collect());
@@ -879,15 +899,21 @@ fn distinct_ops<L: Language>(nodes: &[L]) -> impl Iterator<Item = L::Discriminan
     })
 }
 
-/// Removes `id` from the `classes_by_op` entries of `ops`.
-fn unlist<D: Eq + std::hash::Hash>(
-    classes_by_op: &mut HashMap<D, HashSet<Id>>,
+/// Removes `id` from the `classes_by_op` entries of `ops`, recording each removal
+/// on the trail of an open checkpoint.
+fn unlist<L: Language, D>(
+    classes_by_op: &mut HashMap<L::Discriminant, HashSet<Id>>,
     id: Id,
-    ops: impl IntoIterator<Item = D>,
+    ops: impl IntoIterator<Item = L::Discriminant>,
+    trail: &mut Option<Box<checkpoint::Trail<L, D>>>,
 ) {
     for op in ops {
         if let Some(ids) = classes_by_op.get_mut(&op) {
-            ids.remove(&id);
+            if ids.remove(&id) {
+                if let Some(trail) = trail {
+                    trail.listed(op, id, false);
+                }
+            }
         }
     }
 }
@@ -1139,12 +1165,18 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         for &child in enode.children() {
             let child = self.unionfind.find_mut(child);
             self.classes.get_mut(&child).unwrap().parents.push(id);
+            if let Some(trail) = &mut self.trail {
+                trail.parent_push(child);
+            }
         }
 
         // the next rebuild indexes the new class
         self.pending.push(id);
 
         self.classes.insert(id, class);
+        if let Some(trail) = &mut self.trail {
+            trail.memo(&enode, None);
+        }
         assert!(self.memo.insert(enode, id).is_none());
 
         id
@@ -1266,21 +1298,34 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         // created since the last rebuild) is a no-op.
         let id2_ops = self.unindexed.remove(&id2);
         if let Some(ops) = &id2_ops {
-            unlist(&mut self.classes_by_op, id2, ops.iter().cloned());
+            unlist(
+                &mut self.classes_by_op,
+                id2,
+                ops.iter().cloned(),
+                &mut self.trail,
+            );
         }
         // `id1` now holds `class2`'s nodes: list it under their operators right away,
         // so that `classes_for_op` finds it before the next rebuild too.
         let mut id1_ops = self.unindexed.get_mut(&id1);
         for op in distinct_ops(&class2.nodes) {
             let ids = self.classes_by_op.entry(op.clone()).or_default();
-            if id2_ops.is_none() {
-                ids.remove(&id2);
+            if id2_ops.is_none() && ids.remove(&id2) {
+                if let Some(trail) = &mut self.trail {
+                    trail.listed(op.clone(), id2, false);
+                }
             }
             if ids.insert(id1) {
+                if let Some(trail) = &mut self.trail {
+                    trail.listed(op.clone(), id1, true);
+                }
                 if let Some(ops) = &mut id1_ops {
                     ops.push(op);
                 }
             }
+        }
+        if let Some(trail) = &mut self.trail {
+            trail.union(&self.classes[&id1], &class2);
         }
         self.dirty.push(id1);
         let class1 = self.classes.get_mut(&id1).unwrap();
@@ -1310,6 +1355,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     pub fn set_analysis_data(&mut self, id: Id, new_data: N::Data) {
         let id = self.find_mut(id);
         let class = self.classes.get_mut(&id).unwrap();
+        if let Some(trail) = &mut self.trail {
+            trail.data(id, &class.data);
+        }
         class.data = new_data;
         self.analysis_pending.extend(class.parents.iter().copied());
         N::modify(self, id)
@@ -1364,7 +1412,13 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let mut dirty = std::mem::take(&mut self.dirty);
         if self.reindex_all {
             self.reindex_all = false;
-            self.classes_by_op.values_mut().for_each(|ids| ids.clear());
+            for (op, ids) in self.classes_by_op.iter_mut() {
+                if let Some(trail) = &mut self.trail {
+                    ids.iter()
+                        .for_each(|&id| trail.listed(op.clone(), id, false));
+                }
+                ids.clear();
+            }
             self.unindexed.clear();
             dirty.clear();
             dirty.extend(self.classes.keys().copied());
@@ -1379,26 +1433,36 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let mut trimmed = 0;
         let uf = &mut self.unionfind;
         let classes_by_op = &mut self.classes_by_op;
+        let trail = &mut self.trail;
         for &id in &dirty {
             let class = self.classes.get_mut(&id).unwrap();
             if let Some(ops) = self.unindexed.remove(&id) {
-                unlist(classes_by_op, id, ops);
+                unlist(classes_by_op, id, ops, trail);
             }
 
             let old_len = class.len();
-            class
-                .nodes
-                .iter_mut()
-                .for_each(|n| n.update_children(|id| uf.find_mut(id)));
-            // A dirty class is typically a sorted run of old nodes followed by a few new
-            // ones, which the (stable, run-detecting) sort handles in linear time.
-            class.nodes.sort();
-            class.nodes.dedup();
+            if let Some(trail) = trail {
+                trail.rebuild_class(id, &mut class.nodes, uf);
+            } else {
+                class
+                    .nodes
+                    .iter_mut()
+                    .for_each(|n| n.update_children(|id| uf.find_mut(id)));
+                // A dirty class is typically a sorted run of old nodes followed by a
+                // few new ones, which the (stable, run-detecting) sort handles in
+                // linear time.
+                class.nodes.sort();
+                class.nodes.dedup();
+            }
 
             trimmed += old_len - class.nodes.len();
 
             for op in distinct_ops(&class.nodes) {
-                classes_by_op.entry(op).or_default().insert(id);
+                if classes_by_op.entry(op.clone()).or_default().insert(id) {
+                    if let Some(trail) = trail {
+                        trail.listed(op, id, true);
+                    }
+                }
             }
         }
         debug_assert!(self.unindexed.is_empty());
@@ -1475,6 +1539,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 self.dirty.push(class);
                 let mut node = self.nodes[usize::from(class)].clone();
                 node.update_children(|id| self.find_mut(id));
+                if let Some(trail) = &mut self.trail {
+                    trail.memo(&node, self.memo.get(&node).copied());
+                }
                 if let Some(memo_class) = self.memo.insert(node, class) {
                     let did_something =
                         self.perform_union(memo_class, class, Some(Justification::Congruence));
@@ -1487,6 +1554,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 let class_id = self.find_mut(class_id);
                 let node_data = N::remake(self, &node, class_id);
                 let class = self.classes.get_mut(&class_id).unwrap();
+                if let Some(trail) = &mut self.trail {
+                    trail.data(class_id, &class.data);
+                }
 
                 let did_merge = self.analysis.merge(&mut class.data, node_data);
                 if did_merge.0 {
