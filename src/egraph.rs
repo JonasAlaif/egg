@@ -12,8 +12,8 @@ use log::*;
 
 mod changes;
 mod checkpoint;
-pub use changes::{ChangePos, Changes};
 use changes::{Change, ChangeLog};
+pub use changes::{ChangePos, Changes};
 pub use checkpoint::Checkpoint;
 
 /** A data structure to keep track of equalities between expressions.

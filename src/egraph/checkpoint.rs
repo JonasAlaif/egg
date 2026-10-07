@@ -100,7 +100,10 @@ enum Undo<L: Language, D> {
     /// The whole class before it was borrowed mutably.
     Class { class: Id, nodes: Vec<L>, data: D },
     /// The position of a change-log subscriber was `old` (`None`: it had none).
-    Seen { subscriber: Symbol, old: Option<usize> },
+    Seen {
+        subscriber: Symbol,
+        old: Option<usize>,
+    },
 }
 
 /// How two lists were concatenated: `root` and `loser` long, and whether the

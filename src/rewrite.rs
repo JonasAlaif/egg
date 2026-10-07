@@ -98,7 +98,7 @@ impl<L: Language, N: Analysis<L>> Rewrite<L, N> {
         &self,
         egraph: &EGraph<L, N>,
         changes: &Changes<L>,
-    ) -> Vec<SearchMatches<L>> {
+    ) -> Vec<SearchMatches<'_, L>> {
         self.searcher.search_changes(egraph, changes, usize::MAX)
     }
 
@@ -222,7 +222,7 @@ where
         egraph: &EGraph<L, N>,
         changes: &Changes<L>,
         limit: usize,
-    ) -> Vec<SearchMatches<L>> {
+    ) -> Vec<SearchMatches<'_, L>> {
         let _ = changes;
         self.search_with_limit(egraph, limit)
     }

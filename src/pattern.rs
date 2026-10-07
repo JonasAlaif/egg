@@ -474,7 +474,7 @@ impl<L: Language, A: Analysis<L>> Searcher<L, A> for Pattern<L> {
         egraph: &EGraph<L, A>,
         changes: &Changes<L>,
         mut limit: usize,
-    ) -> Vec<SearchMatches<L>> {
+    ) -> Vec<SearchMatches<'_, L>> {
         let mut roots: Vec<Id> = vec![];
         let mut pinned: Vec<(Id, L)> = vec![];
         let (read_root, read_vars) = &self.data_reads;

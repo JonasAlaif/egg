@@ -464,7 +464,12 @@ mod tests {
                 }
             }
         }
-        assert!(rollbacks > 100 && commits > 100, "{} {}", rollbacks, commits);
+        assert!(
+            rollbacks > 100 && commits > 100,
+            "{} {}",
+            rollbacks,
+            commits
+        );
         // and the search must actually be incremental
         assert!(incremental * 3 < full, "{} of {}", incremental, full);
     }
