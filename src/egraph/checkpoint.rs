@@ -62,8 +62,6 @@ struct Frame {
     uf_log_len: usize,
     /// The end of the change log, `None` if changes were not tracked.
     changes_end: Option<usize>,
-    /// The lowest change-log position a subscriber had (see [`Trail::changes_floor`]).
-    changes_floor: Option<usize>,
 }
 
 /// Source of [`Frame::id`]s.
@@ -300,12 +298,6 @@ impl<L: Language, D> Trail<L, D> {
         }
     }
 
-    /// The lowest change-log position a rollback can restore a subscriber to:
-    /// the lowest one when the outermost checkpoint was opened.
-    pub(crate) fn changes_floor(&self) -> Option<usize> {
-        self.frames.first().and_then(|frame| frame.changes_floor)
-    }
-
     pub(crate) fn seen(&mut self, subscriber: Symbol, old: Option<usize>) {
         self.log.push(Undo::Seen { subscriber, old });
     }
@@ -392,8 +384,10 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             log_len: self.trail.as_ref().map_or(0, |t| t.log.len()),
             uf_log_len: self.unionfind.log_len(),
             changes_end: self.changes.as_ref().map(|log| log.end()),
-            changes_floor: self.changes.as_ref().map(|log| log.lowest_needed(None)),
         };
+        if let (None, Some(log)) = (&*self.trail, &mut self.changes) {
+            log.pinned = Some(log.lowest_needed());
+        }
         let trail = self.trail.get_or_insert_with(|| {
             Box::new(Trail {
                 clone_data: N::Data::clone,
@@ -432,7 +426,6 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let frame = self.frame(&checkpoint);
         let mut trail = self.trail.take().unwrap();
 
-        let floor = trail.changes_floor();
         for undo in trail.log.drain(frame.log_len..).rev() {
             match undo {
                 Undo::Memo { node, old } => match old {
@@ -480,7 +473,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                     class.data = data;
                 }
                 Undo::Seen { subscriber, old } => {
-                    self.changes.as_mut().unwrap().set_seen(subscriber, old, floor);
+                    self.changes.as_mut().unwrap().set_seen(subscriber, old);
                 }
             }
         }
@@ -520,7 +513,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 self.unionfind.log_writes_below(frame.size);
                 *self.trail = Some(trail);
             }
-            None => self.unionfind.clear_log(),
+            None => {
+                self.unionfind.clear_log();
+                if let Some(log) = &mut self.changes {
+                    log.pinned = None;
+                }
+            }
         }
     }
 }

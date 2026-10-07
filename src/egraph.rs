@@ -184,9 +184,8 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         }
         // anything may change: every subscriber must look at the whole e-graph again
         if let Some(log) = &mut self.changes {
-            let floor = self.trail.as_ref().and_then(|trail| trail.changes_floor());
             for subscriber in log.subscribers() {
-                let old = log.set_seen(subscriber, None, floor);
+                let old = log.set_seen(subscriber, None);
                 if let Some(trail) = &mut *self.trail {
                     trail.seen(subscriber, old);
                 }

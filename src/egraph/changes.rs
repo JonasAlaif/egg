@@ -35,30 +35,52 @@ pub(crate) enum Change<L> {
 }
 
 /// The change log of an [`EGraph`] and the position of each subscriber in it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ChangeLog<L> {
     /// The position of `entries[0]`.
     base: usize,
     entries: Vec<Change<L>>,
     seen: HashMap<Symbol, usize>,
+    /// While a checkpoint is open: the lowest subscriber position when the
+    /// outermost one was opened. A rollback may restore any position since.
+    pub(crate) pinned: Option<usize>,
     /// Forgetting is tried again once the log is this long.
     trim_at: usize,
+}
+
+/// A clone has no open checkpoints, so nothing pinned.
+impl<L: Clone> Clone for ChangeLog<L> {
+    fn clone(&self) -> Self {
+        ChangeLog {
+            base: self.base,
+            entries: self.entries.clone(),
+            seen: self.seen.clone(),
+            pinned: None,
+            trim_at: self.trim_at,
+        }
+    }
 }
 
 impl<L> ChangeLog<L> {
     pub(crate) fn push(&mut self, change: Change<L>) {
         self.entries.push(change);
+        // Forget the prefix no one needs, each time the log has doubled.
+        if self.entries.len() >= self.trim_at {
+            let drop = self.lowest_needed() - self.base;
+            self.entries.drain(..drop);
+            self.base += drop;
+            self.trim_at = 2 * self.entries.len().max(64);
+        }
     }
 
     pub(crate) fn end(&self) -> usize {
         self.base + self.entries.len()
     }
 
-    /// The lowest position a subscriber can still ask for, also after a rollback
-    /// to a checkpoint whose subscribers were as low as `floor`.
-    pub(crate) fn lowest_needed(&self, floor: Option<usize>) -> usize {
+    /// The lowest position a subscriber can still ask for, now or after a rollback.
+    pub(crate) fn lowest_needed(&self) -> usize {
         let lowest = self.seen.values().copied().min().unwrap_or(self.end());
-        floor.map_or(lowest, |floor| floor.min(lowest))
+        self.pinned.map_or(lowest, |pinned| pinned.min(lowest))
     }
 
     pub(crate) fn seen(&self, subscriber: Symbol) -> Option<usize> {
@@ -66,24 +88,11 @@ impl<L> ChangeLog<L> {
     }
 
     /// Sets the position of `subscriber` (`None`: forget it), returning the old one.
-    pub(crate) fn set_seen(
-        &mut self,
-        subscriber: Symbol,
-        pos: Option<usize>,
-        floor: Option<usize>,
-    ) -> Option<usize> {
-        let old = match pos {
+    pub(crate) fn set_seen(&mut self, subscriber: Symbol, pos: Option<usize>) -> Option<usize> {
+        match pos {
             Some(pos) => self.seen.insert(subscriber, pos),
             None => self.seen.remove(&subscriber),
-        };
-        // Forget the prefix no one needs, each time the log has doubled.
-        if self.entries.len() >= self.trim_at {
-            let drop = self.lowest_needed(floor) - self.base;
-            self.entries.drain(..drop);
-            self.base += drop;
-            self.trim_at = 2 * self.entries.len().max(64);
         }
-        old
     }
 
     pub(crate) fn subscribers(&self) -> Vec<Symbol> {
@@ -159,6 +168,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 base: 0,
                 entries: vec![],
                 seen: HashMap::default(),
+                pinned: None,
                 trim_at: 0,
             })
         });
@@ -184,8 +194,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let log = self.changes.as_mut().expect("changes are not tracked");
         debug_assert!(pos.0 <= log.end());
         let subscriber = subscriber.into();
-        let floor = self.trail.as_ref().and_then(|trail| trail.changes_floor());
-        let old = log.set_seen(subscriber, Some(pos.0), floor);
+        let old = log.set_seen(subscriber, Some(pos.0));
         if let Some(trail) = &mut *self.trail {
             trail.seen(subscriber, old);
         }
@@ -458,5 +467,33 @@ mod tests {
         assert!(rollbacks > 100 && commits > 100, "{} {}", rollbacks, commits);
         // and the search must actually be incremental
         assert!(incremental * 3 < full, "{} of {}", incremental, full);
+    }
+
+    /// Changes every subscriber has consumed are forgotten, and changes a rollback
+    /// could ask for again are kept.
+    #[test]
+    fn consumed_changes_are_forgotten() {
+        let mut g = G::default();
+        g.track_changes();
+        let log_len = |g: &G| g.changes.as_ref().unwrap().entries.len();
+        for i in 0..1000 {
+            g.add(Math::Num(i));
+            g.rebuild();
+            let pos = g.change_pos().unwrap();
+            g.mark_seen("a", pos);
+        }
+        assert!(log_len(&g) <= 128, "{}", log_len(&g));
+
+        let seen = g.change_pos().unwrap();
+        let checkpoint = g.checkpoint();
+        for i in 1000..2000 {
+            g.add(Math::Num(i));
+            g.rebuild();
+            let pos = g.change_pos().unwrap();
+            g.mark_seen("a", pos);
+        }
+        g.rollback(checkpoint);
+        assert_eq!(g.seen("a"), Some(seen));
+        assert!(g.changes_since(seen).unwrap().is_empty());
     }
 }
