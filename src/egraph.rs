@@ -1515,12 +1515,13 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 let class_id = self.find_mut(class_id);
                 let node_data = N::remake(self, &node, class_id);
                 let class = self.classes.get_mut(&class_id).unwrap();
-                let old = self.trail.as_ref().map(|trail| trail.copy(&class.data));
+                // Recorded whatever `merge` reports: a merge may change the data
+                // without saying so (an ordering that ignores part of it).
+                if let Some(trail) = &mut *self.trail {
+                    trail.data(class_id, &class.data);
+                }
 
                 let did_merge = self.analysis.merge(&mut class.data, node_data);
-                if let (Some(trail), Some(old), true) = (&mut *self.trail, old, did_merge.0) {
-                    trail.data_was(class_id, old);
-                }
                 if did_merge.0 {
                     self.analysis_pending.extend(class.parents.iter().copied());
                     N::modify(self, class_id)
