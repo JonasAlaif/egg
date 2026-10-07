@@ -60,6 +60,8 @@ struct Frame {
     size: usize,
     log_len: usize,
     uf_log_len: usize,
+    /// The end of the change log, `None` if changes were not tracked.
+    changes_end: Option<usize>,
 }
 
 /// Source of [`Frame::id`]s.
@@ -97,6 +99,11 @@ enum Undo<L: Language, D> {
     },
     /// The whole class before it was borrowed mutably.
     Class { class: Id, nodes: Vec<L>, data: D },
+    /// The position of a change-log subscriber was `old` (`None`: it had none).
+    Seen {
+        subscriber: Symbol,
+        old: Option<usize>,
+    },
 }
 
 /// How two lists were concatenated: `root` and `loser` long, and whether the
@@ -294,6 +301,10 @@ impl<L: Language, D> Trail<L, D> {
         }
     }
 
+    pub(crate) fn seen(&mut self, subscriber: Symbol, old: Option<usize>) {
+        self.log.push(Undo::Seen { subscriber, old });
+    }
+
     /// Records `class` whole before it is borrowed mutably.
     pub(crate) fn class(&mut self, class: &EClass<L, D>) {
         self.log.push(Undo::Class {
@@ -375,7 +386,11 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             size,
             log_len: self.trail.as_ref().map_or(0, |t| t.log.len()),
             uf_log_len: self.unionfind.log_len(),
+            changes_end: self.changes.as_ref().map(|log| log.end()),
         };
+        if let (None, Some(log)) = (&*self.trail, &mut self.changes) {
+            log.pinned = Some(log.lowest_needed());
+        }
         let trail = self.trail.get_or_insert_with(|| {
             Box::new(Trail {
                 clone_data: N::Data::clone,
@@ -460,6 +475,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                     class.nodes = nodes;
                     class.data = data;
                 }
+                Undo::Seen { subscriber, old } => {
+                    self.changes.as_mut().unwrap().set_seen(subscriber, old);
+                }
             }
         }
 
@@ -467,6 +485,10 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         self.unionfind.rollback(frame.uf_log_len, size);
         self.nodes.truncate(size);
         self.classes.truncate(size);
+        match frame.changes_end {
+            Some(end) => self.changes.as_mut().unwrap().truncate(end),
+            None => self.changes = None,
+        }
         self.pending.clear();
         while self.analysis_pending.pop().is_some() {}
         self.dirty.clear();
@@ -494,7 +516,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 self.unionfind.log_writes_below(frame.size);
                 *self.trail = Some(trail);
             }
-            None => self.unionfind.clear_log(),
+            None => {
+                self.unionfind.clear_log();
+                if let Some(log) = &mut self.changes {
+                    log.pinned = None;
+                }
+            }
         }
     }
 }
@@ -686,6 +713,7 @@ mod tests {
                                     6 + !delta.dropped.is_empty() as usize
                                 }
                                 Undo::Class { .. } => 8,
+                                Undo::Seen { .. } => unreachable!(),
                             }] += 1;
                         }
                         seen[9] += (checkpoint.depth + 1 < g.open_checkpoints()) as usize;
@@ -912,7 +940,7 @@ mod tests {
                 }
                 Undo::Class { nodes, .. } => nodes.len(),
                 Undo::Memo { .. } | Undo::Listed { .. } => 1,
-                Undo::ParentPush { .. } | Undo::Data { .. } => 0,
+                Undo::ParentPush { .. } | Undo::Data { .. } | Undo::Seen { .. } => 0,
             })
             .sum();
         assert!(recorded < 10, "recorded {} nodes", recorded);

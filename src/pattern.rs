@@ -68,6 +68,110 @@ pub struct Pattern<L> {
     /// The actual pattern as a [`RecExpr`]
     pub ast: PatternAst<L>,
     program: machine::Program<L>,
+    places: Vec<Place<L>>,
+    /// Whose analysis data a match's consumer reads: the root's, and the classes
+    /// of these variables (`None`: all of them). See [`Pattern::with_data_reads`].
+    data_reads: (bool, Option<Vec<Var>>),
+}
+
+/// An e-node or variable occurrence of a pattern, with the path to it from the
+/// root: for each e-node above it, its operator (children zeroed) and the child
+/// taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place<L> {
+    /// The operator of an e-node, `None` for a variable.
+    op: Option<L>,
+    var: Option<Var>,
+    path: Vec<(L, usize)>,
+    /// For an e-node below the root whose ancestors' other children are all
+    /// variables of its own subpattern: the subpattern's matcher, and the
+    /// ancestors bottom-up (each its node and the child taken). From a match of
+    /// the subpattern at a changed e-node, each ancestor is then determined and
+    /// found by a lookup instead of a scan of parents.
+    climb: Option<(machine::Program<L>, Vec<Step<L>>)>,
+}
+
+/// An ancestor of a place: its operator (children zeroed), the child the path
+/// takes, and the variable at each other child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Step<L> {
+    op: L,
+    child: usize,
+    vars: Vec<Option<Var>>,
+}
+
+impl<L: Language> Place<L> {
+    fn all(ast: &PatternAst<L>) -> Vec<Self> {
+        fn vars<L: Language>(ast: &PatternAst<L>, id: Id, out: &mut Vec<Var>) {
+            match &ast[id] {
+                ENodeOrVar::Var(v) => out.push(*v),
+                ENodeOrVar::ENode(n) => n.for_each(|c| vars(ast, c, out)),
+            }
+        }
+        fn walk<L: Language>(
+            ast: &PatternAst<L>,
+            id: Id,
+            above: &mut Vec<(Id, usize)>,
+            out: &mut Vec<Place<L>>,
+        ) {
+            let op_of = |id: Id| match &ast[id] {
+                ENodeOrVar::ENode(n) => n.clone().map_children(|_| Id::from(0)),
+                ENodeOrVar::Var(_) => unreachable!("a variable has no children"),
+            };
+            let path = above.iter().map(|&(a, i)| (op_of(a), i)).collect();
+            match &ast[id] {
+                ENodeOrVar::Var(v) => out.push(Place {
+                    op: None,
+                    var: Some(*v),
+                    path,
+                    climb: None,
+                }),
+                ENodeOrVar::ENode(node) => {
+                    let mut bound = vec![];
+                    vars(ast, id, &mut bound);
+                    let groundable = above.iter().all(|&(a, i)| match &ast[a] {
+                        ENodeOrVar::ENode(n) => n.children().iter().enumerate().all(|(j, &c)| {
+                            j == i || matches!(&ast[c], ENodeOrVar::Var(v) if bound.contains(v))
+                        }),
+                        ENodeOrVar::Var(_) => false,
+                    });
+                    let climb = (!above.is_empty() && groundable).then(|| {
+                        let sub = machine::Program::compile_from_pat(&ast.extract(id));
+                        let steps = above.iter().rev().map(|&(a, i)| Step {
+                            op: op_of(a),
+                            child: i,
+                            vars: match &ast[a] {
+                                ENodeOrVar::ENode(n) => n
+                                    .children()
+                                    .iter()
+                                    .map(|&c| match &ast[c] {
+                                        ENodeOrVar::Var(v) => Some(*v),
+                                        ENodeOrVar::ENode(_) => None,
+                                    })
+                                    .collect(),
+                                ENodeOrVar::Var(_) => unreachable!("an ancestor is an e-node"),
+                            },
+                        });
+                        (sub, steps.collect())
+                    });
+                    out.push(Place {
+                        op: Some(op_of(id)),
+                        var: None,
+                        path,
+                        climb,
+                    });
+                    for (i, &child) in node.children().iter().enumerate() {
+                        above.push((id, i));
+                        walk(ast, child, above, out);
+                        above.pop();
+                    }
+                }
+            }
+        }
+        let mut out = vec![];
+        walk(ast, ast.root(), &mut vec![], &mut out);
+        out
+    }
 }
 
 /// A [`RecExpr`] that represents a
@@ -107,7 +211,23 @@ impl<L: Language> Pattern<L> {
     pub fn new(ast: PatternAst<L>) -> Self {
         let ast = ast.compact();
         let program = machine::Program::compile_from_pat(&ast);
-        Pattern { ast, program }
+        let places = Place::all(&ast);
+        Pattern {
+            ast,
+            program,
+            places,
+            data_reads: (true, None),
+        }
+    }
+
+    /// Declares whose analysis data the consumer of this pattern's matches reads:
+    /// the root class's if `root`, and the classes bound to `vars`. By default it
+    /// is all of them. [`Searcher::search_changes`] then returns a match whose
+    /// data changed only if that data is read: a rewrite whose applier reads no
+    /// data (a [`Pattern`] right-hand side) passes `false` and no variables.
+    pub fn with_data_reads(mut self, root: bool, vars: &[Var]) -> Self {
+        self.data_reads = (root, Some(vars.to_vec()));
+        self
     }
 
     /// Returns a list of the [`Var`]s in this pattern.
@@ -293,6 +413,34 @@ pub struct SearchMatches<'a, L: Language> {
     pub ast: Option<Cow<'a, PatternAst<L>>>,
 }
 
+/// The root e-node (with its class) above `class` along `steps` (bottom-up: each
+/// ancestor pattern node and the child taken), its other children read from
+/// `subst`; `None` if some ancestor is not in the e-graph.
+fn climb<L: Language, A: Analysis<L>>(
+    egraph: &EGraph<L, A>,
+    class: Id,
+    subst: &Subst,
+    steps: &[Step<L>],
+) -> Option<(Id, L)> {
+    let mut class = class;
+    let mut node = None;
+    for step in steps {
+        let mut j = 0;
+        let up = step.op.clone().map_children(|_| {
+            let child = match step.vars[j] {
+                _ if j == step.child => class,
+                Some(v) => subst[v],
+                None => unreachable!("a climbable ancestor's other children are variables"),
+            };
+            j += 1;
+            egraph.find(child)
+        });
+        class = egraph.find(egraph.lookup(up.clone())?);
+        node = Some(up);
+    }
+    node.map(|node| (class, node))
+}
+
 impl<L: Language, A: Analysis<L>> Searcher<L, A> for Pattern<L> {
     fn get_pattern_ast(&self) -> Option<&PatternAst<L>> {
         Some(&self.ast)
@@ -314,6 +462,92 @@ impl<L: Language, A: Analysis<L>> Searcher<L, A> for Pattern<L> {
                 limit,
             ),
         }
+    }
+
+    /// Searches only where a change can have made a new match: at each changed
+    /// e-node in a position of the pattern (the root e-node itself; below the root,
+    /// the root e-nodes found from it by lookups, or else the root classes above it
+    /// along its path), and at every root whose match can bind a class whose data
+    /// changed and is read (see [`Pattern::with_data_reads`]).
+    fn search_changes(
+        &self,
+        egraph: &EGraph<L, A>,
+        changes: &Changes<L>,
+        mut limit: usize,
+    ) -> Vec<SearchMatches<'_, L>> {
+        let mut roots: Vec<Id> = vec![];
+        let mut pinned: Vec<(Id, L)> = vec![];
+        let (read_root, read_vars) = &self.data_reads;
+        for place in &self.places {
+            // the classes at this place of a match that may be new
+            let mut bottoms: Vec<Id> = vec![];
+            match &place.op {
+                Some(op) => {
+                    for (class, node) in changes.nodes(&op.discriminant()) {
+                        if !op.matches(node) {
+                            continue;
+                        }
+                        match &place.climb {
+                            _ if place.path.is_empty() => pinned.push((*class, node.clone())),
+                            Some((sub, steps)) => {
+                                for subst in sub.run_at(egraph, *class, Some(node), usize::MAX) {
+                                    pinned.extend(climb(egraph, *class, &subst, steps));
+                                }
+                            }
+                            None => bottoms.push(*class),
+                        }
+                    }
+                }
+                // a variable root matches every class, so a new class is a new match
+                None if place.path.is_empty() => roots.extend(changes.classes()),
+                None => {}
+            }
+            let reads = match place.var {
+                _ if place.path.is_empty() => *read_root,
+                Some(v) => read_vars.as_ref().is_none_or(|vars| vars.contains(&v)),
+                None => false,
+            };
+            if reads {
+                bottoms.extend(changes.data());
+            }
+            if !bottoms.is_empty() {
+                roots.extend(egraph.ancestors(bottoms, &place.path));
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        pinned.sort_unstable();
+        pinned.dedup();
+        pinned.retain(|(class, _)| roots.binary_search(class).is_err());
+
+        let mut matches = vec![];
+        for eclass in roots {
+            if limit == 0 {
+                break;
+            }
+            if let Some(m) = self.search_eclass_with_limit(egraph, eclass, limit) {
+                limit -= m.substs.len();
+                matches.push(m);
+            }
+        }
+        for group in pinned.chunk_by(|a, b| a.0 == b.0) {
+            let eclass = group[0].0;
+            let mut substs = vec![];
+            for (_, node) in group {
+                substs.extend(self.program.run_at(egraph, eclass, Some(node), limit));
+                limit -= substs.len().min(limit);
+            }
+            if !substs.is_empty() {
+                let ast = Some(Cow::Borrowed(&self.ast));
+                matches.push(SearchMatches {
+                    eclass,
+                    substs,
+                    ast,
+                });
+            }
+        }
+        matches.sort_by_key(|m| m.eclass);
+        matches
     }
 
     fn search_eclass_with_limit(

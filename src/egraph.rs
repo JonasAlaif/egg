@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use log::*;
 
+mod changes;
 mod checkpoint;
+use changes::{Change, ChangeLog};
+pub use changes::{ChangePos, Changes};
 pub use checkpoint::Checkpoint;
 
 /** A data structure to keep track of equalities between expressions.
@@ -88,6 +91,10 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     /// checkpoint is open.
     #[cfg_attr(feature = "serde-1", serde(skip, default = "no_trail"))]
     trail: checkpoint::Recording<L, N::Data>,
+    /// The changes since [`EGraph::track_changes`] that some subscriber has not
+    /// consumed yet; `None` while changes are not tracked.
+    #[cfg_attr(feature = "serde-1", serde(skip, default = "no_trail"))]
+    changes: Option<Box<ChangeLog<L>>>,
     #[cfg_attr(
         feature = "serde-1",
         serde(bound(
@@ -156,6 +163,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             unindexed: Default::default(),
             reindex_all: false,
             trail: Default::default(),
+            changes: None,
             classes_by_op: Default::default(),
         }
     }
@@ -173,6 +181,15 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         self.reindex_all = true;
         if let Some(trail) = &mut *self.trail {
             self.classes.values().for_each(|class| trail.class(class));
+        }
+        // anything may change: every subscriber must look at the whole e-graph again
+        if let Some(log) = &mut self.changes {
+            for subscriber in log.subscribers() {
+                let old = log.set_seen(subscriber, None);
+                if let Some(trail) = &mut *self.trail {
+                    trail.seen(subscriber, old);
+                }
+            }
         }
         self.classes.values_mut()
     }
@@ -688,6 +705,7 @@ where
                 .collect(),
             reindex_all: src_egraph.reindex_all,
             trail: Default::default(),
+            changes: None,
             classes: src_egraph.classes.map(|eclass| self.map_eclass(eclass)),
             classes_by_op: src_egraph
                 .classes_by_op
@@ -854,6 +872,9 @@ impl<L: Language, N: Analysis<L>> std::ops::IndexMut<Id> for EGraph<L, N> {
             .unwrap_or_else(|| panic!("Invalid id {}", id));
         if let Some(trail) = &mut *self.trail {
             trail.class(class);
+        }
+        if let Some(log) = &mut self.changes {
+            log.push(Change::Class(id));
         }
         if !self.unindexed.contains_key(&id) {
             self.unindexed
@@ -1292,9 +1313,17 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         assert_eq!(id1, class1.id);
 
         self.pending.extend(class2.parents.iter().copied());
+        if let Some(log) = &mut self.changes {
+            for node in &class2.nodes {
+                log.push(Change::Moved(id1, node.clone()));
+            }
+        }
         let did_merge = self.analysis.merge(&mut class1.data, class2.data);
         if did_merge.0 {
             self.analysis_pending.extend(class1.parents.iter().copied());
+            if let Some(log) = &mut self.changes {
+                log.push(Change::Data(id1));
+            }
         }
         if did_merge.1 {
             self.analysis_pending.extend(class2.parents.iter().copied());
@@ -1317,6 +1346,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let class = self.classes.get_mut(&id).unwrap();
         if let Some(trail) = &mut *self.trail {
             trail.data(id, &class.data);
+        }
+        if let Some(log) = &mut self.changes {
+            log.push(Change::Data(id));
         }
         class.data = new_data;
         self.analysis_pending.extend(class.parents.iter().copied());
@@ -1498,6 +1530,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 // the enode is new or a child of it was merged away: its class must
                 // canonicalize it again
                 self.dirty.push(class);
+                if let Some(log) = &mut self.changes {
+                    log.push(Change::Node(class));
+                }
                 let mut node = self.nodes[usize::from(class)].clone();
                 node.update_children(|id| self.find_mut(id));
                 if let Some(trail) = &mut *self.trail {
@@ -1524,6 +1559,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 let did_merge = self.analysis.merge(&mut class.data, node_data);
                 if did_merge.0 {
                     self.analysis_pending.extend(class.parents.iter().copied());
+                    if let Some(log) = &mut self.changes {
+                        log.push(Change::Data(class_id));
+                    }
                     N::modify(self, class_id)
                 }
             }
