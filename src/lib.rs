@@ -90,7 +90,7 @@ pub(crate) use {eclass::ClassMap, explain::Explain, unionfind::UnionFind};
 pub use {
     dot::Dot,
     eclass::EClass,
-    egraph::{Checkpoint, EGraph, LanguageMapper, SimpleLanguageMapper},
+    egraph::{ChangePos, Changes, Checkpoint, EGraph, LanguageMapper, SimpleLanguageMapper},
     explain::{
         Explanation, FlatExplanation, FlatTerm, Justification, TreeExplanation, TreeTerm,
         UnionEqualities,

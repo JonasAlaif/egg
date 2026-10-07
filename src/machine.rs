@@ -3,11 +3,12 @@ use std::result;
 
 type Result = result::Result<(), ()>;
 
-#[derive(Default)]
-struct Machine {
+struct Machine<'a, L> {
     reg: Vec<Id>,
     // a buffer to re-use for lookups
     lookup: Vec<Id>,
+    // the only e-node the root may be matched against, if any
+    root_node: Option<&'a L>,
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -33,13 +34,13 @@ enum ENodeOrReg<L> {
     Reg(Reg),
 }
 
-impl Machine {
+impl<'a, L: Language> Machine<'a, L> {
     #[inline(always)]
     fn reg(&self, reg: Reg) -> Id {
         self.reg[reg.0 as usize]
     }
 
-    fn run<L, N>(
+    fn run<N>(
         &mut self,
         egraph: &EGraph<L, N>,
         instructions: &[Instruction<L>],
@@ -47,7 +48,6 @@ impl Machine {
         yield_fn: &mut impl FnMut(&Self, &Subst) -> Result,
     ) -> Result
     where
-        L: Language,
         N: Analysis<L>,
     {
         let mut instructions = instructions.iter();
@@ -55,12 +55,19 @@ impl Machine {
             match instruction {
                 Instruction::Bind { i, out, node } => {
                     let remaining_instructions = instructions.as_slice();
+                    let mut bind = |machine: &mut Self, matched: &L| {
+                        machine.reg.truncate(out.0 as usize);
+                        matched.for_each(|id| machine.reg.push(id));
+                        machine.run(egraph, remaining_instructions, subst, yield_fn)
+                    };
+                    if let (Reg(0), Some(root)) = (i, self.root_node) {
+                        return match node.matches(root) {
+                            true => bind(self, root),
+                            false => Ok(()),
+                        };
+                    }
                     let eclass = &egraph[self.reg(*i)];
-                    return eclass.for_each_matching_node(node, |matched| {
-                        self.reg.truncate(out.0 as usize);
-                        matched.for_each(|id| self.reg.push(id));
-                        self.run(egraph, remaining_instructions, subst, yield_fn)
-                    });
+                    return eclass.for_each_matching_node(node, |matched| bind(self, matched));
                 }
                 Instruction::Scan { out } => {
                     let remaining_instructions = instructions.as_slice();
@@ -292,10 +299,20 @@ impl<L: Language> Program<L> {
         compiler.extract()
     }
 
-    pub fn run_with_limit<A>(
+    pub fn run_with_limit<A>(&self, egraph: &EGraph<L, A>, eclass: Id, limit: usize) -> Vec<Subst>
+    where
+        A: Analysis<L>,
+    {
+        self.run_at(egraph, eclass, None, limit)
+    }
+
+    /// The matches rooted at `eclass`; if `root_node` is given, only those whose root
+    /// is that e-node of the class.
+    pub(crate) fn run_at<A>(
         &self,
         egraph: &EGraph<L, A>,
         eclass: Id,
+        root_node: Option<&L>,
         mut limit: usize,
     ) -> Vec<Subst>
     where
@@ -307,7 +324,11 @@ impl<L: Language> Program<L> {
             return vec![];
         }
 
-        let mut machine = Machine::default();
+        let mut machine = Machine {
+            reg: vec![],
+            lookup: vec![],
+            root_node,
+        };
         assert_eq!(machine.reg.len(), 0);
         machine.reg.push(eclass);
 

@@ -68,6 +68,49 @@ pub struct Pattern<L> {
     /// The actual pattern as a [`RecExpr`]
     pub ast: PatternAst<L>,
     program: machine::Program<L>,
+    places: Vec<Place<L>>,
+}
+
+/// An e-node or variable occurrence of a pattern, with the path to it from the root:
+/// for each e-node above it, its operator and the child taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place<L> {
+    /// The operator (children zeroed) of an e-node; `None` for a variable.
+    op: Option<L>,
+    path: Vec<(L, usize)>,
+}
+
+impl<L: Language> Place<L> {
+    fn all(ast: &PatternAst<L>) -> Vec<Self> {
+        fn walk<L: Language>(
+            ast: &PatternAst<L>,
+            id: Id,
+            path: &mut Vec<(L, usize)>,
+            out: &mut Vec<Place<L>>,
+        ) {
+            match &ast[id] {
+                ENodeOrVar::Var(_) => out.push(Place {
+                    op: None,
+                    path: path.clone(),
+                }),
+                ENodeOrVar::ENode(node) => {
+                    let op = node.clone().map_children(|_| Id::from(0));
+                    out.push(Place {
+                        op: Some(op.clone()),
+                        path: path.clone(),
+                    });
+                    for (i, &child) in node.children().iter().enumerate() {
+                        path.push((op.clone(), i));
+                        walk(ast, child, path, out);
+                        path.pop();
+                    }
+                }
+            }
+        }
+        let mut out = vec![];
+        walk(ast, ast.root(), &mut vec![], &mut out);
+        out
+    }
 }
 
 /// A [`RecExpr`] that represents a
@@ -107,7 +150,12 @@ impl<L: Language> Pattern<L> {
     pub fn new(ast: PatternAst<L>) -> Self {
         let ast = ast.compact();
         let program = machine::Program::compile_from_pat(&ast);
-        Pattern { ast, program }
+        let places = Place::all(&ast);
+        Pattern {
+            ast,
+            program,
+            places,
+        }
     }
 
     /// Returns a list of the [`Var`]s in this pattern.
@@ -314,6 +362,78 @@ impl<L: Language, A: Analysis<L>> Searcher<L, A> for Pattern<L> {
                 limit,
             ),
         }
+    }
+
+    /// Searches only where a change can have made a new match: at the e-nodes that
+    /// changed in a position of the pattern (a changed root e-node alone; any other
+    /// e-node from the roots above it along its path), and at every root whose match
+    /// can bind a class whose data changed (as the root or a variable).
+    fn search_changes(
+        &self,
+        egraph: &EGraph<L, A>,
+        changes: &Changes<L>,
+        mut limit: usize,
+    ) -> Vec<SearchMatches<L>> {
+        let mut roots: Vec<Id> = vec![];
+        let mut pinned: Vec<(Id, &L)> = vec![];
+        for place in &self.places {
+            match &place.op {
+                Some(op) => {
+                    for (class, node) in changes.nodes(&op.discriminant()) {
+                        if !op.matches(node) {
+                            continue;
+                        }
+                        if place.path.is_empty() {
+                            pinned.push((*class, node));
+                        } else {
+                            roots.extend(egraph.ancestors(*class, &place.path));
+                        }
+                    }
+                }
+                // a variable root matches every class, so a new class is a new match
+                None if place.path.is_empty() => roots.extend(changes.classes()),
+                None => {}
+            }
+            if place.op.is_none() || place.path.is_empty() {
+                for &class in changes.data() {
+                    roots.extend(egraph.ancestors(class, &place.path));
+                }
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        pinned.sort_unstable();
+        pinned.dedup();
+        pinned.retain(|(class, _)| roots.binary_search(class).is_err());
+
+        let mut matches = vec![];
+        for eclass in roots {
+            if limit == 0 {
+                break;
+            }
+            if let Some(m) = self.search_eclass_with_limit(egraph, eclass, limit) {
+                limit -= m.substs.len();
+                matches.push(m);
+            }
+        }
+        for group in pinned.chunk_by(|a, b| a.0 == b.0) {
+            let eclass = group[0].0;
+            let mut substs = vec![];
+            for (_, node) in group {
+                substs.extend(self.program.run_at(egraph, eclass, Some(node), limit));
+                limit -= substs.len().min(limit);
+            }
+            if !substs.is_empty() {
+                let ast = Some(Cow::Borrowed(&self.ast));
+                matches.push(SearchMatches {
+                    eclass,
+                    substs,
+                    ast,
+                });
+            }
+        }
+        matches.sort_by_key(|m| m.eclass);
+        matches
     }
 
     fn search_eclass_with_limit(

@@ -91,6 +91,17 @@ impl<L: Language, N: Analysis<L>> Rewrite<L, N> {
         self.searcher.search_with_limit(egraph, limit)
     }
 
+    /// Call [`search_changes`] on the [`Searcher`].
+    ///
+    /// [`search_changes`]: Searcher::search_changes()
+    pub fn search_changes(
+        &self,
+        egraph: &EGraph<L, N>,
+        changes: &Changes<L>,
+    ) -> Vec<SearchMatches<L>> {
+        self.searcher.search_changes(egraph, changes, usize::MAX)
+    }
+
     /// Call [`apply_matches`] on the [`Applier`].
     ///
     /// [`apply_matches`]: Applier::apply_matches()
@@ -196,6 +207,24 @@ where
     /// [`search`]: Searcher::search
     fn search_with_limit(&self, egraph: &EGraph<L, N>, limit: usize) -> Vec<SearchMatches<L>> {
         search_eclasses_with_limit(self, egraph, egraph.classes().map(|e| e.id), limit)
+    }
+
+    /// Like [`search_with_limit`](Searcher::search_with_limit), but only needs to
+    /// return the matches that are new since `changes` began: those that involve an
+    /// e-node in [`Changes::nodes`] or read the data of a class in
+    /// [`Changes::data`]. It may return more. Matching only where something changed
+    /// is incremental (semi-naive) e-matching; its cost is proportional to the
+    /// changes rather than to the e-graph.
+    ///
+    /// The default searches the whole e-graph.
+    fn search_changes(
+        &self,
+        egraph: &EGraph<L, N>,
+        changes: &Changes<L>,
+        limit: usize,
+    ) -> Vec<SearchMatches<L>> {
+        let _ = changes;
+        self.search_with_limit(egraph, limit)
     }
 
     /// Returns the number of matches in the e-graph
