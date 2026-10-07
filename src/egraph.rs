@@ -67,6 +67,22 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     /// not the canonical id of the eclass.
     pending: Vec<Id>,
     analysis_pending: UniqueQueue<Id>,
+    /// The classes [`EGraph::rebuild`] must repair: classes created or merged into
+    /// since the last rebuild, classes holding an enode whose child was merged away,
+    /// and classes borrowed mutably. Every other class still has canonical, sorted,
+    /// deduplicated nodes and is listed in `classes_by_op` under exactly its
+    /// operators, so a rebuild costs time in the size of these classes only.
+    /// Not in egg 0.11's format, so absent when loading a graph serialized by it.
+    #[cfg_attr(feature = "serde-1", serde(default))]
+    dirty: Vec<Id>,
+    /// For each class borrowed mutably since the last rebuild (the borrower may have
+    /// changed its nodes), the operators `classes_by_op` lists it under.
+    #[cfg_attr(feature = "serde-1", serde(skip))]
+    unindexed: HashMap<Id, Vec<L::Discriminant>>,
+    /// Whether the next rebuild repairs and re-indexes every class: after
+    /// [`EGraph::classes_mut`], and after deserializing (the index is not serialized).
+    #[cfg_attr(feature = "serde-1", serde(skip, default = "default_reindex_all"))]
+    reindex_all: bool,
     #[cfg_attr(
         feature = "serde-1",
         serde(bound(
@@ -90,6 +106,11 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
 #[cfg(feature = "serde-1")]
 fn default_classes_by_op<K>() -> HashMap<K, HashSet<Id>> {
     HashMap::default()
+}
+
+#[cfg(feature = "serde-1")]
+fn default_reindex_all() -> bool {
+    true
 }
 
 impl<L: Language, N: Analysis<L> + Default> Default for EGraph<L, N> {
@@ -121,6 +142,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             pending: Default::default(),
             memo: Default::default(),
             analysis_pending: Default::default(),
+            dirty: Default::default(),
+            unindexed: Default::default(),
+            reindex_all: false,
             classes_by_op: Default::default(),
         }
     }
@@ -131,7 +155,11 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     }
 
     /// Returns an mutating iterator over the eclasses in the egraph.
+    ///
+    /// The next [`rebuild`](EGraph::rebuild) repairs every class, as the caller may
+    /// have changed any class's nodes.
     pub fn classes_mut(&mut self) -> impl ExactSizeIterator<Item = &mut EClass<L, N::Data>> {
+        self.reindex_all = true;
         self.classes.values_mut()
     }
 
@@ -634,6 +662,16 @@ where
                 .map(|x| self.map_node(x))
                 .collect(),
             analysis_pending: src_egraph.analysis_pending,
+            dirty: src_egraph.dirty,
+            unindexed: src_egraph
+                .unindexed
+                .into_iter()
+                .map(|(id, ops)| {
+                    let ops = ops.into_iter().map(|op| self.map_discriminant(op));
+                    (id, ops.collect())
+                })
+                .collect(),
+            reindex_all: src_egraph.reindex_all,
             classes: src_egraph
                 .classes
                 .into_iter()
@@ -792,12 +830,50 @@ impl<L: Language, N: Analysis<L>> std::ops::Index<Id> for EGraph<L, N> {
 
 /// Given an `Id` using the `&mut egraph[id]` syntax, retrieve a mutable
 /// reference to the e-class.
+///
+/// The next [`rebuild`](EGraph::rebuild) repairs the class, as the caller may have
+/// changed its nodes.
 impl<L: Language, N: Analysis<L>> std::ops::IndexMut<Id> for EGraph<L, N> {
     fn index_mut(&mut self, id: Id) -> &mut Self::Output {
         let id = self.find_mut(id);
-        self.classes
+        let class = self
+            .classes
             .get_mut(&id)
-            .unwrap_or_else(|| panic!("Invalid id {}", id))
+            .unwrap_or_else(|| panic!("Invalid id {}", id));
+        if !self.unindexed.contains_key(&id) {
+            self.unindexed
+                .insert(id, distinct_ops(&class.nodes).collect());
+            self.dirty.push(id);
+        }
+        class
+    }
+}
+
+/// The operators of `nodes`, an operator shared by consecutive nodes only once
+/// (so every operator exactly once if `nodes` is sorted).
+fn distinct_ops<L: Language>(nodes: &[L]) -> impl Iterator<Item = L::Discriminant> + '_ {
+    let mut last = None;
+    nodes.iter().filter_map(move |node| {
+        let op = node.discriminant();
+        if last.as_ref() == Some(&op) {
+            None
+        } else {
+            last = Some(op.clone());
+            Some(op)
+        }
+    })
+}
+
+/// Removes `id` from the `classes_by_op` entries of `ops`.
+fn unlist<D: Eq + std::hash::Hash>(
+    classes_by_op: &mut HashMap<D, HashSet<Id>>,
+    id: Id,
+    ops: impl IntoIterator<Item = D>,
+) {
+    for op in ops {
+        if let Some(ids) = classes_by_op.get_mut(&op) {
+            ids.remove(&id);
+        }
     }
 }
 
@@ -1045,11 +1121,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         self.nodes.push(original);
 
         // add this enode to the parent lists of its children
-        enode.for_each(|child| {
-            self[child].parents.push(id);
-        });
+        for &child in enode.children() {
+            let child = self.unionfind.find_mut(child);
+            self.classes.get_mut(&child).unwrap().parents.push(id);
+        }
 
-        // TODO is this needed?
+        // the next rebuild indexes the new class
         self.pending.push(id);
 
         self.classes.insert(id, class);
@@ -1169,6 +1246,13 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
 
         assert_ne!(id1, id2);
         let class2 = self.classes.remove(&id2).unwrap();
+        // `id2` no longer names a class. Unlisting an id the index never held (a class
+        // created since the last rebuild) is a no-op.
+        match self.unindexed.remove(&id2) {
+            Some(ops) => unlist(&mut self.classes_by_op, id2, ops),
+            None => unlist(&mut self.classes_by_op, id2, distinct_ops(&class2.nodes)),
+        }
+        self.dirty.push(id1);
         let class1 = self.classes.get_mut(&id1).unwrap();
         assert_eq!(id1, class1.id);
 
@@ -1243,54 +1327,77 @@ impl<L: Language + Display, N: Analysis<L>> EGraph<L, N> {
 
 // All the rebuilding stuff
 impl<L: Language, N: Analysis<L>> EGraph<L, N> {
+    /// Repairs the dirty classes: canonicalizes, sorts and deduplicates their nodes,
+    /// and lists them in `classes_by_op` under exactly their operators.
     #[inline(never)]
     fn rebuild_classes(&mut self) -> usize {
-        let mut classes_by_op = std::mem::take(&mut self.classes_by_op);
-        classes_by_op.values_mut().for_each(|ids| ids.clear());
+        let mut dirty = std::mem::take(&mut self.dirty);
+        if self.reindex_all {
+            self.reindex_all = false;
+            self.classes_by_op.values_mut().for_each(|ids| ids.clear());
+            self.unindexed.clear();
+            dirty.clear();
+            dirty.extend(self.classes.keys().copied());
+        } else {
+            for id in &mut dirty {
+                *id = self.unionfind.find_mut(*id);
+            }
+        }
+        dirty.sort_unstable();
+        dirty.dedup();
 
         let mut trimmed = 0;
         let uf = &mut self.unionfind;
+        let classes_by_op = &mut self.classes_by_op;
+        for &id in &dirty {
+            let class = self.classes.get_mut(&id).unwrap();
+            if let Some(ops) = self.unindexed.remove(&id) {
+                unlist(classes_by_op, id, ops);
+            }
 
-        for class in self.classes.values_mut() {
             let old_len = class.len();
             class
                 .nodes
                 .iter_mut()
                 .for_each(|n| n.update_children(|id| uf.find_mut(id)));
-            class.nodes.sort_unstable();
+            // A dirty class is typically a sorted run of old nodes followed by a few new
+            // ones, which the (stable, run-detecting) sort handles in linear time.
+            class.nodes.sort();
             class.nodes.dedup();
 
             trimmed += old_len - class.nodes.len();
 
-            let mut add = |n: &L| {
-                classes_by_op
-                    .entry(n.discriminant())
-                    .or_default()
-                    .insert(class.id)
-            };
-
-            // we can go through the ops in order to dedup them, becaue we
-            // just sorted them
-            let mut nodes = class.nodes.iter();
-            if let Some(mut prev) = nodes.next() {
-                add(prev);
-                for n in nodes {
-                    if !prev.matches(n) {
-                        add(n);
-                        prev = n;
-                    }
-                }
+            for op in distinct_ops(&class.nodes) {
+                classes_by_op.entry(op).or_default().insert(id);
             }
         }
+        debug_assert!(self.unindexed.is_empty());
 
-        #[cfg(debug_assertions)]
-        for ids in classes_by_op.values_mut() {
-            let unique: HashSet<Id> = ids.iter().copied().collect();
-            assert_eq!(ids.len(), unique.len());
-        }
-
-        self.classes_by_op = classes_by_op;
+        dirty.clear();
+        self.dirty = dirty;
         trimmed
+    }
+
+    /// Checks that every class is repaired and listed in `classes_by_op` under exactly
+    /// its operators, as if every class had been rebuilt.
+    #[inline(never)]
+    fn check_classes(&self) -> bool {
+        let mut classes_by_op: HashMap<L::Discriminant, HashSet<Id>> = HashMap::default();
+        for (&id, class) in self.classes.iter() {
+            assert!(class.nodes.windows(2).all(|w| w[0] < w[1]));
+            for node in &class.nodes {
+                assert!(node.all(|child| self.find(child) == child));
+                classes_by_op
+                    .entry(node.discriminant())
+                    .or_default()
+                    .insert(id);
+            }
+        }
+        for (op, ids) in &self.classes_by_op {
+            assert_eq!(*ids, classes_by_op.remove(op).unwrap_or_default());
+        }
+        assert!(classes_by_op.is_empty());
+        true
     }
 
     #[inline(never)]
@@ -1333,6 +1440,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
 
         while !self.pending.is_empty() || !self.analysis_pending.is_empty() {
             while let Some(class) = self.pending.pop() {
+                // the enode is new or a child of it was merged away: its class must
+                // canonicalize it again
+                self.dirty.push(class);
                 let mut node = self.nodes[usize::from(class)].clone();
                 node.update_children(|id| self.find_mut(id));
                 if let Some(memo_class) = self.memo.insert(node, class) {
@@ -1368,8 +1478,10 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// [in the tutorial](tutorials/_01_background/index.html#invariants-and-rebuilding),
     /// `egg` takes a lazy approach to maintaining the egraph invariants.
     /// The `rebuild` method allows the user to manually restore those
-    /// invariants at a time of their choosing. It's a reasonably
-    /// fast, linear-ish traversal through the egraph.
+    /// invariants at a time of their choosing. Its cost is proportional to the
+    /// e-classes changed since the last rebuild (created, merged, holding an
+    /// e-node whose child was merged, or borrowed mutably), not to the size of
+    /// the e-graph.
     ///
     /// After modifying an e-graph with [`add`](EGraph::add) or
     /// [`union`](EGraph::union), you must call `rebuild` to restore
@@ -1427,6 +1539,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         );
 
         debug_assert!(self.check_memo());
+        debug_assert!(self.check_classes());
         self.clean = true;
         n_unions
     }
@@ -1493,5 +1606,117 @@ mod tests {
 
         let json_rep = serde_json::to_string_pretty(&egraph).unwrap();
         println!("{}", json_rep);
+    }
+
+    #[cfg(all(feature = "serde-1", feature = "serde_json"))]
+    #[test]
+    fn deserialized_egraph_is_indexed_on_rebuild() {
+        let mut egraph = EGraph::<SymbolLang, ()>::default();
+        let id = egraph.add_expr(&"(foo bar baz)".parse().unwrap());
+        egraph.rebuild();
+        let json_rep = serde_json::to_string(&egraph).unwrap();
+
+        let mut egraph: EGraph<SymbolLang, ()> = serde_json::from_str(&json_rep).unwrap();
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+        let foo = SymbolLang::new("foo", vec![id, id]).discriminant();
+        assert_eq!(
+            egraph.classes_for_op(&foo).unwrap().collect::<Vec<_>>(),
+            [id]
+        );
+    }
+
+    /// A graph serialized by egg 0.11, which has no `dirty` field, still loads.
+    #[cfg(all(feature = "serde-1", feature = "serde_json"))]
+    #[test]
+    fn egraph_without_dirty_field_deserializes() {
+        let mut egraph = EGraph::<SymbolLang, ()>::default();
+        egraph.add_expr(&"(foo bar baz)".parse().unwrap());
+        egraph.rebuild();
+        let mut json: serde_json::Value = serde_json::to_value(&egraph).unwrap();
+        json.as_object_mut().unwrap().remove("dirty").unwrap();
+
+        let mut egraph: EGraph<SymbolLang, ()> = serde_json::from_value(json).unwrap();
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+    }
+
+    /// Rebuilds after rounds of adds and unions repair only the classes that changed;
+    /// the result must be what rebuilding every class gives.
+    #[test]
+    fn incremental_rebuild_matches_full_rebuild() {
+        use SymbolLang as S;
+
+        let mut egraph = EGraph::<S, ()>::default();
+        let leaves: Vec<Id> = (0..32)
+            .map(|i| egraph.add(S::leaf(format!("x{i}"))))
+            .collect();
+        let mut terms = leaves.clone();
+        for (i, &x) in leaves.iter().enumerate() {
+            let y = leaves[(i * 7 + 3) % leaves.len()];
+            terms.push(egraph.add(S::new("f", vec![x])));
+            terms.push(egraph.add(S::new("g", vec![x, y])));
+        }
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+
+        for round in 1..6 {
+            for i in (0..leaves.len()).step_by(round + 1) {
+                let a = leaves[i];
+                let b = leaves[(i + round) % leaves.len()];
+                egraph.union(a, b);
+                let fa = egraph.add(S::new("f", vec![a]));
+                egraph.add(S::new("h", vec![fa, b]));
+            }
+            egraph.rebuild();
+            assert!(egraph.check_classes());
+            assert!(egraph.check_memo());
+            for &x in &leaves {
+                for &y in &leaves {
+                    if egraph.find(x) == egraph.find(y) {
+                        let fx = egraph.lookup(S::new("f", vec![x])).unwrap();
+                        let fy = egraph.lookup(S::new("f", vec![y])).unwrap();
+                        assert_eq!(egraph.find(fx), egraph.find(fy));
+                    }
+                }
+            }
+        }
+
+        let mut full = egraph.clone();
+        full.classes_mut();
+        full.rebuild();
+        for class in egraph.classes() {
+            assert_eq!(class.nodes, full[class.id].nodes);
+        }
+    }
+
+    /// A class whose nodes are edited through `&mut egraph[id]` or `classes_mut` is
+    /// re-indexed on rebuild.
+    #[test]
+    fn rebuild_reindexes_mutated_classes() {
+        use SymbolLang as S;
+
+        let mut egraph = EGraph::<S, ()>::default();
+        let x = egraph.add(S::leaf("x"));
+        let fx = egraph.add(S::new("f", vec![x]));
+        let gx = egraph.add(S::new("g", vec![x]));
+        egraph.union(fx, gx);
+        egraph.rebuild();
+        let f = S::new("f", vec![x]).discriminant();
+        let g = S::new("g", vec![x]).discriminant();
+        assert_eq!(egraph.classes_for_op(&f).unwrap().len(), 1);
+
+        egraph[fx].nodes.retain(|n| n.op != "f".into());
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+        assert_eq!(egraph.classes_for_op(&f).unwrap().len(), 0);
+        assert_eq!(egraph.classes_for_op(&g).unwrap().len(), 1);
+
+        for class in egraph.classes_mut() {
+            class.nodes.retain(|n| n.op != "g".into());
+        }
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+        assert_eq!(egraph.classes_for_op(&g).unwrap().len(), 0);
     }
 }
