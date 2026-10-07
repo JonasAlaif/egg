@@ -58,7 +58,8 @@ use crate::*;
 /// // This is the search method from the Searcher trait
 /// let matches = same_add.search(&egraph);
 /// let matched_eclasses: Vec<Id> = matches.iter().map(|m| m.eclass).collect();
-/// assert_eq!(matched_eclasses, vec![a22, a11]);
+/// // matches come in e-class id order
+/// assert_eq!(matched_eclasses, vec![a11, a22]);
 /// ```
 ///
 /// [`FromStr`]: std::str::FromStr

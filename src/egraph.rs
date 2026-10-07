@@ -87,7 +87,7 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     /// How to undo the changes made since each open [`Checkpoint`]; `None` while no
     /// checkpoint is open.
     #[cfg_attr(feature = "serde-1", serde(skip, default = "no_trail"))]
-    trail: Option<Box<checkpoint::Trail<L, N::Data>>>,
+    trail: checkpoint::Recording<L, N::Data>,
     #[cfg_attr(
         feature = "serde-1",
         serde(bound(
@@ -95,10 +95,10 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
             deserialize = "N::Data: for<'a> Deserialize<'a>",
         ))
     )]
-    pub(crate) classes: HashMap<Id, EClass<L, N::Data>>,
+    pub(crate) classes: ClassMap<L, N::Data>,
     #[cfg_attr(feature = "serde-1", serde(skip))]
     #[cfg_attr(feature = "serde-1", serde(default = "default_classes_by_op"))]
-    classes_by_op: HashMap<L::Discriminant, HashSet<Id>>,
+    classes_by_op: HashMap<L::Discriminant, std::collections::BTreeSet<Id>>,
     /// Whether or not reading operation are allowed on this e-graph.
     /// Mutating operations will set this to `false`, and
     /// [`EGraph::rebuild`] will set it to true.
@@ -109,7 +109,7 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
 }
 
 #[cfg(feature = "serde-1")]
-fn default_classes_by_op<K>() -> HashMap<K, HashSet<Id>> {
+fn default_classes_by_op<K>() -> HashMap<K, std::collections::BTreeSet<Id>> {
     HashMap::default()
 }
 
@@ -119,8 +119,8 @@ fn default_reindex_all() -> bool {
 }
 
 #[cfg(feature = "serde-1")]
-fn no_trail<T>() -> Option<T> {
-    None
+fn no_trail<T: Default>() -> T {
+    T::default()
 }
 
 impl<L: Language, N: Analysis<L> + Default> Default for EGraph<L, N> {
@@ -155,12 +155,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             dirty: Default::default(),
             unindexed: Default::default(),
             reindex_all: false,
-            trail: None,
+            trail: Default::default(),
             classes_by_op: Default::default(),
         }
     }
 
-    /// Returns an iterator over the eclasses in the egraph.
+    /// Returns an iterator over the eclasses in the egraph, in increasing id order.
     pub fn classes(&self) -> impl ExactSizeIterator<Item = &EClass<L, N::Data>> {
         self.classes.values()
     }
@@ -171,13 +171,14 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// have changed any class's nodes.
     pub fn classes_mut(&mut self) -> impl ExactSizeIterator<Item = &mut EClass<L, N::Data>> {
         self.reindex_all = true;
-        if let Some(trail) = &mut self.trail {
+        if let Some(trail) = &mut *self.trail {
             self.classes.values().for_each(|class| trail.class(class));
         }
         self.classes.values_mut()
     }
 
-    /// Returns an iterator over the eclasses that contain a given op.
+    /// Returns an iterator over the eclasses that contain a given op, in increasing
+    /// id order.
     pub fn classes_for_op(
         &self,
         op: &L::Discriminant,
@@ -667,7 +668,7 @@ where
         EGraph {
             analysis: self.map_analysis(src_egraph.analysis),
             explain: None,
-            unionfind: src_egraph.unionfind,
+            unionfind: src_egraph.unionfind.without_log(),
             memo: src_egraph.memo.into_iter().map(kv_map).collect(),
             pending: src_egraph.pending,
             nodes: src_egraph
@@ -686,12 +687,8 @@ where
                 })
                 .collect(),
             reindex_all: src_egraph.reindex_all,
-            trail: None,
-            classes: src_egraph
-                .classes
-                .into_iter()
-                .map(|(id, eclass)| (id, self.map_eclass(eclass)))
-                .collect(),
+            trail: Default::default(),
+            classes: src_egraph.classes.map(|eclass| self.map_eclass(eclass)),
             classes_by_op: src_egraph
                 .classes_by_op
                 .into_iter()
@@ -855,7 +852,7 @@ impl<L: Language, N: Analysis<L>> std::ops::IndexMut<Id> for EGraph<L, N> {
             .classes
             .get_mut(&id)
             .unwrap_or_else(|| panic!("Invalid id {}", id));
-        if let Some(trail) = &mut self.trail {
+        if let Some(trail) = &mut *self.trail {
             trail.class(class);
         }
         if !self.unindexed.contains_key(&id) {
@@ -885,7 +882,7 @@ fn distinct_ops<L: Language>(nodes: &[L]) -> impl Iterator<Item = L::Discriminan
 /// Removes `id` from the `classes_by_op` entries of `ops`, recording each removal
 /// on the trail of an open checkpoint.
 fn unlist<L: Language, D>(
-    classes_by_op: &mut HashMap<L::Discriminant, HashSet<Id>>,
+    classes_by_op: &mut HashMap<L::Discriminant, std::collections::BTreeSet<Id>>,
     id: Id,
     ops: impl IntoIterator<Item = L::Discriminant>,
     trail: &mut Option<Box<checkpoint::Trail<L, D>>>,
@@ -1148,7 +1145,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         for &child in enode.children() {
             let child = self.unionfind.find_mut(child);
             self.classes.get_mut(&child).unwrap().parents.push(id);
-            if let Some(trail) = &mut self.trail {
+            if let Some(trail) = &mut *self.trail {
                 trail.parent_push(child);
             }
         }
@@ -1157,7 +1154,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         self.pending.push(id);
 
         self.classes.insert(id, class);
-        if let Some(trail) = &mut self.trail {
+        if let Some(trail) = &mut *self.trail {
             trail.memo(&enode, None);
         }
         assert!(self.memo.insert(enode, id).is_none());
@@ -1279,15 +1276,15 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         // `id2` no longer names a class. Unlisting an id the index never held (a class
         // created since the last rebuild) is a no-op.
         match self.unindexed.remove(&id2) {
-            Some(ops) => unlist(&mut self.classes_by_op, id2, ops, &mut self.trail),
+            Some(ops) => unlist(&mut self.classes_by_op, id2, ops, &mut *self.trail),
             None => unlist(
                 &mut self.classes_by_op,
                 id2,
                 distinct_ops(&class2.nodes),
-                &mut self.trail,
+                &mut *self.trail,
             ),
         }
-        if let Some(trail) = &mut self.trail {
+        if let Some(trail) = &mut *self.trail {
             trail.union(&self.classes[&id1], &class2);
         }
         self.dirty.push(id1);
@@ -1318,7 +1315,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     pub fn set_analysis_data(&mut self, id: Id, new_data: N::Data) {
         let id = self.find_mut(id);
         let class = self.classes.get_mut(&id).unwrap();
-        if let Some(trail) = &mut self.trail {
+        if let Some(trail) = &mut *self.trail {
             trail.data(id, &class.data);
         }
         class.data = new_data;
@@ -1376,7 +1373,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         if self.reindex_all {
             self.reindex_all = false;
             for (op, ids) in self.classes_by_op.iter_mut() {
-                if let Some(trail) = &mut self.trail {
+                if let Some(trail) = &mut *self.trail {
                     ids.iter()
                         .for_each(|&id| trail.listed(op.clone(), id, false));
                 }
@@ -1396,7 +1393,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let mut trimmed = 0;
         let uf = &mut self.unionfind;
         let classes_by_op = &mut self.classes_by_op;
-        let trail = &mut self.trail;
+        let trail = &mut *self.trail;
         for &id in &dirty {
             let class = self.classes.get_mut(&id).unwrap();
             if let Some(ops) = self.unindexed.remove(&id) {
@@ -1439,7 +1436,8 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// its operators, as if every class had been rebuilt.
     #[inline(never)]
     fn check_classes(&self) -> bool {
-        let mut classes_by_op: HashMap<L::Discriminant, HashSet<Id>> = HashMap::default();
+        let mut classes_by_op: HashMap<L::Discriminant, std::collections::BTreeSet<Id>> =
+            HashMap::default();
         for (&id, class) in self.classes.iter() {
             assert!(class.nodes.windows(2).all(|w| w[0] < w[1]));
             for node in &class.nodes {
@@ -1502,7 +1500,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 self.dirty.push(class);
                 let mut node = self.nodes[usize::from(class)].clone();
                 node.update_children(|id| self.find_mut(id));
-                if let Some(trail) = &mut self.trail {
+                if let Some(trail) = &mut *self.trail {
                     trail.memo(&node, self.memo.get(&node).copied());
                 }
                 if let Some(memo_class) = self.memo.insert(node, class) {
@@ -1517,11 +1515,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 let class_id = self.find_mut(class_id);
                 let node_data = N::remake(self, &node, class_id);
                 let class = self.classes.get_mut(&class_id).unwrap();
-                if let Some(trail) = &mut self.trail {
-                    trail.data(class_id, &class.data);
-                }
+                let old = self.trail.as_ref().map(|trail| trail.copy(&class.data));
 
                 let did_merge = self.analysis.merge(&mut class.data, node_data);
+                if let (Some(trail), Some(old), true) = (&mut *self.trail, old, did_merge.0) {
+                    trail.data_was(class_id, old);
+                }
                 if did_merge.0 {
                     self.analysis_pending.extend(class.parents.iter().copied());
                     N::modify(self, class_id)

@@ -1,7 +1,7 @@
 use crate::Id;
 use std::fmt::Debug;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize, serde::Deserialize))]
 pub struct UnionFind {
     parents: Vec<Id>,
@@ -13,7 +13,24 @@ pub struct UnionFind {
     logged_below: usize,
 }
 
+/// A clone records nothing: checkpoints belong to the e-graph they were opened on.
+impl Clone for UnionFind {
+    fn clone(&self) -> Self {
+        UnionFind {
+            parents: self.parents.clone(),
+            undo: Vec::new(),
+            logged_below: 0,
+        }
+    }
+}
+
 impl UnionFind {
+    /// This union-find, recording nothing.
+    pub(crate) fn without_log(mut self) -> Self {
+        self.clear_log();
+        self
+    }
+
     /// Records overwrites of the entries that exist now, until the next call;
     /// `0` stops recording.
     pub(crate) fn log_writes_below(&mut self, len: usize) {

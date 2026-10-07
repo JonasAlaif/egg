@@ -11,9 +11,39 @@
 //! a record costs at most what the change cost.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The trail of an e-graph, `None` while no checkpoint is open. A clone of an
+/// e-graph has no open checkpoints: checkpoints belong to the e-graph they were
+/// opened on, so the clone of a trail is empty.
+pub(crate) struct Recording<L: Language, D>(Option<Box<Trail<L, D>>>);
+
+impl<L: Language, D> Default for Recording<L, D> {
+    fn default() -> Self {
+        Recording(None)
+    }
+}
+
+impl<L: Language, D> Clone for Recording<L, D> {
+    fn clone(&self) -> Self {
+        Recording(None)
+    }
+}
+
+impl<L: Language, D> std::ops::Deref for Recording<L, D> {
+    type Target = Option<Box<Trail<L, D>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<L: Language, D> std::ops::DerefMut for Recording<L, D> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Every checkpoint open on an e-graph, and how to undo what happened since.
-#[derive(Clone)]
 pub(crate) struct Trail<L: Language, D> {
     /// Captured by [`EGraph::checkpoint`], the only place that needs `D: Clone`.
     clone_data: fn(&D) -> D,
@@ -23,11 +53,17 @@ pub(crate) struct Trail<L: Language, D> {
 
 #[derive(Clone, Copy, Debug)]
 struct Frame {
+    /// Unique among all checkpoints of the process, so a token can only close the
+    /// checkpoint it was issued for.
+    id: u64,
     /// Number of ids (e-nodes) when the checkpoint was opened.
     size: usize,
     log_len: usize,
     uf_log_len: usize,
 }
+
+/// Source of [`Frame::id`]s.
+static NEXT_FRAME: AtomicU64 = AtomicU64::new(0);
 
 /// One undo record.
 #[derive(Clone)]
@@ -234,6 +270,17 @@ impl<L: Language, D> Trail<L, D> {
         self.log.push(Undo::Data { class, old });
     }
 
+    /// A copy of `data`, to record with [`Self::data_was`] once it is known to
+    /// have changed.
+    pub(crate) fn copy(&self, data: &D) -> D {
+        (self.clone_data)(data)
+    }
+
+    /// The analysis data of `class` was `old` (a copy made before a change).
+    pub(crate) fn data_was(&mut self, class: Id, old: D) {
+        self.log.push(Undo::Data { class, old });
+    }
+
     /// Records a union of `loser` into `root`, before the lists are concatenated.
     pub(crate) fn union(&mut self, root: &EClass<L, D>, loser: &EClass<L, D>) {
         self.data(root.id, &root.data);
@@ -274,7 +321,7 @@ impl<L: Language, D> Trail<L, D> {
 #[derive(Debug)]
 pub struct Checkpoint {
     depth: usize,
-    size: usize,
+    id: u64,
 }
 
 impl<L: Language, N: Analysis<L>> EGraph<L, N> {
@@ -282,13 +329,18 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// its state now, [`commit`](EGraph::commit) keeps the changes made since.
     /// Checkpoints nest; they are closed in the reverse order of opening.
     ///
-    /// The e-graph is [rebuilt](EGraph::rebuild) first if it needs to be. While a
-    /// checkpoint is open every change also records how to undo it, at a cost
-    /// proportional to the change (a mutable borrow of a class, through
-    /// `egraph[id]` or [`classes_mut`](EGraph::classes_mut), records the whole
-    /// class, as the borrower may change anything); with no checkpoint open nothing
-    /// is recorded. State held by the [`Analysis`] value itself (rather than in the
-    /// per-class data) is not restored.
+    /// The e-graph is [rebuilt](EGraph::rebuild) first. While a checkpoint is open
+    /// every change also records how to undo it, at a cost proportional to the
+    /// change (a mutable borrow of a class, through `egraph[id]` or
+    /// [`classes_mut`](EGraph::classes_mut), records the whole class, as the
+    /// borrower may change anything); with no checkpoint open nothing is recorded.
+    /// State held by the [`Analysis`] value itself (rather than in the per-class
+    /// data) is not restored.
+    ///
+    /// The returned token closes exactly this checkpoint of this e-graph; closing
+    /// it any other way panics. A token that is dropped instead leaves the
+    /// checkpoint open (and recording) until an enclosing one is closed. A clone of
+    /// the e-graph has no open checkpoints.
     ///
     /// Explanations are not supported: panics if they are enabled.
     ///
@@ -314,11 +366,13 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             self.explain.is_none(),
             "checkpoints are not supported with explanations enabled"
         );
-        if !self.clean {
-            self.rebuild();
-        }
+        // Restore the invariants first, whatever is pending (a mutable borrow or
+        // `set_analysis_data` leaves work queued without clearing `clean`): the
+        // rollback restores this state and drops every queue.
+        self.rebuild();
         let size = self.unionfind.size();
         let frame = Frame {
+            id: NEXT_FRAME.fetch_add(1, Ordering::Relaxed),
             size,
             log_len: self.trail.as_ref().map_or(0, |t| t.log.len()),
             uf_log_len: self.unionfind.log_len(),
@@ -334,8 +388,19 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         self.unionfind.log_writes_below(size);
         Checkpoint {
             depth: trail.frames.len() - 1,
-            size,
+            id: frame.id,
         }
+    }
+
+    /// The frame `checkpoint` was issued for. Panics if it is not open on this
+    /// e-graph (closed by an enclosing rollback or commit, or another e-graph's).
+    fn frame(&self, checkpoint: &Checkpoint) -> Frame {
+        let frame = self
+            .trail
+            .as_ref()
+            .and_then(|t| t.frames.get(checkpoint.depth))
+            .filter(|f| f.id == checkpoint.id);
+        *frame.expect("checkpoint is not open on this e-graph")
     }
 
     /// The number of open checkpoints.
@@ -347,9 +412,8 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// and every checkpoint opened after it. Ids created since are no longer valid.
     /// The restored e-graph is clean. Costs time proportional to the changes undone.
     pub fn rollback(&mut self, checkpoint: Checkpoint) {
-        let mut trail = self.trail.take().expect("no open checkpoint");
-        let frame = trail.frames[checkpoint.depth];
-        assert_eq!(frame.size, checkpoint.size, "checkpoint of another e-graph");
+        let frame = self.frame(&checkpoint);
+        let mut trail = self.trail.take().unwrap();
 
         for undo in trail.log.drain(frame.log_len..).rev() {
             match undo {
@@ -401,12 +465,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         }
 
         let size = frame.size;
-        let old_size = self.unionfind.size();
         self.unionfind.rollback(frame.uf_log_len, size);
         self.nodes.truncate(size);
-        for id in size..old_size {
-            self.classes.remove(&Id::from(id));
-        }
+        self.classes.truncate(size);
         self.pending.clear();
         while self.analysis_pending.pop().is_some() {}
         self.dirty.clear();
@@ -421,11 +482,8 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// Closes `checkpoint` (and every checkpoint opened after it), keeping the changes
     /// made since. An enclosing checkpoint still undoes them.
     pub fn commit(&mut self, checkpoint: Checkpoint) {
-        let mut trail = self.trail.take().expect("no open checkpoint");
-        assert_eq!(
-            trail.frames[checkpoint.depth].size, checkpoint.size,
-            "checkpoint of another e-graph"
-        );
+        self.frame(&checkpoint);
+        let mut trail = self.trail.take().unwrap();
         trail.frames.truncate(checkpoint.depth);
         self.reopen(trail);
     }
@@ -435,7 +493,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         match trail.frames.last() {
             Some(frame) => {
                 self.unionfind.log_writes_below(frame.size);
-                self.trail = Some(trail);
+                *self.trail = Some(trail);
             }
             None => self.unionfind.clear_log(),
         }
@@ -482,34 +540,37 @@ mod tests {
 
     type G = EGraph<Math, Fold>;
 
-    /// Asserts `a` and `b` are the same e-graph, field by field.
+    /// Asserts `a` and `b` are the same e-graph, field by field, including the order
+    /// `classes()` and `classes_for_op` iterate in, and that both have nothing
+    /// pending.
     fn assert_identical(a: &G, b: &G) {
         assert_eq!(a.unionfind.parents(), b.unionfind.parents());
         assert_eq!(a.nodes, b.nodes);
         assert_eq!(a.memo, b.memo);
-        assert_eq!(a.classes.len(), b.classes.len());
-        for (id, class) in &a.classes {
-            let other = &b.classes[id];
-            assert_eq!(class.nodes, other.nodes, "nodes of {id}");
-            assert_eq!(class.data, other.data, "data of {id}");
-            assert_eq!(class.parents, other.parents, "parents of {id}");
+        let classes = |g: &G| g.classes().map(|c| c.id).collect::<Vec<_>>();
+        assert_eq!(classes(a), classes(b), "class order");
+        for class in a.classes() {
+            let other = &b.classes[&class.id];
+            assert_eq!(class.nodes, other.nodes, "nodes of {}", class.id);
+            assert_eq!(class.data, other.data, "data of {}", class.id);
+            assert_eq!(class.parents, other.parents, "parents of {}", class.id);
         }
         let listed = |g: &G| -> Vec<(String, Vec<Id>)> {
             let mut v: Vec<_> = g
                 .classes_by_op
                 .iter()
                 .filter(|(_, ids)| !ids.is_empty())
-                .map(|(op, ids)| {
-                    let mut ids: Vec<Id> = ids.iter().copied().collect();
-                    ids.sort();
-                    (format!("{op:?}"), ids)
-                })
+                .map(|(op, _)| (format!("{:?}", op), g.classes_for_op(op).unwrap().collect()))
                 .collect();
             v.sort();
             v
         };
-        assert_eq!(listed(a), listed(b));
-        assert!(a.clean && b.clean);
+        assert_eq!(listed(a), listed(b), "classes_for_op");
+        for g in [a, b] {
+            assert!(g.clean);
+            assert!(g.pending.is_empty() && g.analysis_pending.is_empty());
+            assert!(g.dirty.is_empty() && g.unindexed.is_empty() && !g.reindex_all);
+        }
     }
 
     /// A small deterministic generator (xorshift64*).
@@ -531,7 +592,14 @@ mod tests {
         Add(Math),
         Union(Id, Id),
         Rebuild,
+        /// `egraph[id].data = d`
         SetData(Id, Option<i32>),
+        /// `set_analysis_data`
+        SetAnalysis(Id, Option<i32>),
+        /// Prune a node through `egraph[id]`, as an `Analysis::modify` may.
+        Prune(Id),
+        /// Borrow every class mutably.
+        ClassesMut,
     }
 
     fn apply(g: &mut G, op: &Op) {
@@ -546,31 +614,48 @@ mod tests {
                 g.rebuild();
             }
             Op::SetData(id, d) => g[*id].data = *d,
+            Op::SetAnalysis(id, d) => g.set_analysis_data(*id, *d),
+            Op::Prune(id) => {
+                let class = &mut g[*id];
+                if class.nodes.len() > 1 {
+                    class.nodes.pop();
+                }
+            }
+            Op::ClassesMut => g.classes_mut().for_each(|_| ()),
         }
     }
 
     fn random_op(rng: &mut Rng, g: &G) -> Op {
         let n = g.unionfind.size();
         let id = |rng: &mut Rng| Id::from(rng.below(n));
-        match rng.below(10) {
+        match rng.below(14) {
             0..=1 => Op::Add(Math::Num(rng.below(8) as i32)),
             2 => Op::Add(Math::Symbol(format!("x{}", rng.below(12)).into())),
             3..=4 => Op::Add(Math::F([id(rng)])),
             5 => Op::Add(Math::Add([id(rng), id(rng)])),
             6..=7 => Op::Union(id(rng), id(rng)),
             8 => Op::Rebuild,
-            _ => Op::SetData(id(rng), None),
+            9 => Op::SetData(id(rng), None),
+            10 => Op::SetAnalysis(id(rng), Some(rng.below(8) as i32)),
+            11 => Op::Prune(id(rng)),
+            12 if rng.below(4) == 0 => Op::ClassesMut,
+            _ => Op::Union(id(rng), id(rng)),
         }
     }
 
-    /// Random adds, unions, rebuilds and mutable borrows under random nested
-    /// checkpoints. Every rollback must restore exactly the e-graph as it was when
-    /// its checkpoint was opened, which must also be what replaying the operations
-    /// before the checkpoint into a fresh e-graph produces.
+    /// Random adds, unions, rebuilds, data edits (through `egraph[id]` and
+    /// `set_analysis_data`, both of which leave work pending without clearing
+    /// `clean`), node pruning and `classes_mut` under random nested checkpoints,
+    /// closed by rolling back a random open one (not only the innermost) or
+    /// committing the innermost. Every rollback must restore exactly the e-graph as
+    /// it was when its checkpoint was opened, iteration orders included, which must
+    /// also be what replaying the operations before the checkpoint into a fresh
+    /// e-graph produces. A clone taken under a checkpoint must have none and record
+    /// nothing.
     #[test]
     fn rollback_restores_the_checkpointed_egraph() {
         let mut seen = [0usize; 11];
-        for seed in 1..=300u64 {
+        for seed in 1..=400u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut g = G::default();
             let mut ops: Vec<Op> = Vec::new();
@@ -589,7 +674,8 @@ mod tests {
                         open.push((checkpoint, g.clone(), ops.len()));
                     }
                     1 if !open.is_empty() => {
-                        let (checkpoint, snapshot, len) = open.pop().unwrap();
+                        let k = rng.below(open.len());
+                        let (checkpoint, snapshot, len) = open.drain(k..).next().unwrap();
                         for undo in &g.trail.as_ref().unwrap().log {
                             seen[match undo {
                                 Undo::Memo { .. } => 0,
@@ -603,7 +689,7 @@ mod tests {
                                 Undo::Class { .. } => 8,
                             }] += 1;
                         }
-                        seen[9] += (checkpoint.depth > 0) as usize;
+                        seen[9] += (checkpoint.depth + 1 < g.open_checkpoints()) as usize;
                         g.rollback(checkpoint);
                         ops.truncate(len);
                         assert_identical(&g, &snapshot);
@@ -617,6 +703,15 @@ mod tests {
                         let (checkpoint, _, _) = open.pop().unwrap();
                         seen[10] += 1;
                         g.commit(checkpoint);
+                    }
+                    3 if !open.is_empty() => {
+                        let mut copy = g.clone();
+                        assert_eq!(copy.open_checkpoints(), 0);
+                        copy.add(Math::Symbol("new".into()));
+                        let some = Id::from(rng.below(copy.unionfind.size()));
+                        copy.union(some, Id::from(0));
+                        copy.rebuild();
+                        assert!(copy.trail.is_none() && copy.unionfind.log_len() == 0);
                     }
                     _ => {
                         let op = random_op(&mut rng, &g);
@@ -636,6 +731,71 @@ mod tests {
         }
         // every kind of record, a dedup, an inner rollback and a commit happened
         assert!(seen.iter().all(|&n| n > 0), "{:?}", seen);
+    }
+
+    /// Work queued without clearing `clean` (by `set_analysis_data`, a mutable
+    /// borrow of a class, `classes_mut`) is settled by `checkpoint`, not lost by a
+    /// rollback: the result equals the same edits without a checkpoint.
+    #[test]
+    fn checkpoint_settles_pending_work() {
+        let edits: [fn(&mut G, Id, Id); 3] = [
+            |g, a, _| g.set_analysis_data(a, Some(2)),
+            |g, _, fx| {
+                let x = g.find(fx);
+                g[x].nodes.retain(|n| matches!(n, Math::Symbol(_)));
+            },
+            |g, a, _| {
+                for c in g.classes_mut() {
+                    if c.id == a {
+                        c.data = Some(5);
+                    }
+                }
+            },
+        ];
+        for edit in edits {
+            let mut g = G::default();
+            let a = g.add(Math::Symbol("a".into()));
+            let one = g.add(Math::Num(1));
+            g.add(Math::Add([a, one]));
+            let x = g.add(Math::Symbol("x".into()));
+            let fx = g.add(Math::F([x]));
+            g.union(x, fx);
+            g.rebuild();
+            edit(&mut g, a, fx);
+            let mut reference = g.clone();
+            reference.rebuild();
+            let checkpoint = g.checkpoint();
+            g.add(Math::Num(7));
+            g.rebuild();
+            g.rollback(checkpoint);
+            assert_identical(&g, &reference);
+        }
+    }
+
+    /// A token closed by an enclosing rollback cannot close the checkpoint that
+    /// later took its place.
+    #[test]
+    #[should_panic(expected = "not open on this e-graph")]
+    fn stale_checkpoint_is_rejected() {
+        let mut g = G::default();
+        g.add(Math::Num(1));
+        let outer = g.checkpoint();
+        let inner = g.checkpoint();
+        g.rollback(outer);
+        let _again = g.checkpoint();
+        let _again_inner = g.checkpoint();
+        g.rollback(inner);
+    }
+
+    /// A token closes only the e-graph it was issued by.
+    #[test]
+    #[should_panic(expected = "not open on this e-graph")]
+    fn foreign_checkpoint_is_rejected() {
+        let mut g = G::default();
+        let mut h = G::default();
+        let checkpoint = g.checkpoint();
+        let _other = h.checkpoint();
+        h.commit(checkpoint);
     }
 
     /// Rolling back to an outer checkpoint closes the inner ones too.
