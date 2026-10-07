@@ -41,6 +41,8 @@ pub(crate) struct ChangeLog<L> {
     base: usize,
     entries: Vec<Change<L>>,
     seen: HashMap<Symbol, usize>,
+    /// Forgetting is tried again once the log is this long.
+    trim_at: usize,
 }
 
 impl<L> ChangeLog<L> {
@@ -74,11 +76,12 @@ impl<L> ChangeLog<L> {
             Some(pos) => self.seen.insert(subscriber, pos),
             None => self.seen.remove(&subscriber),
         };
-        // Forget the prefix no one needs, once it is at least half the log.
-        let drop = self.lowest_needed(floor) - self.base;
-        if drop > 0 && 2 * drop >= self.entries.len() {
+        // Forget the prefix no one needs, each time the log has doubled.
+        if self.entries.len() >= self.trim_at {
+            let drop = self.lowest_needed(floor) - self.base;
             self.entries.drain(..drop);
             self.base += drop;
+            self.trim_at = 2 * self.entries.len().max(64);
         }
         old
     }
@@ -101,16 +104,27 @@ impl<L> ChangeLog<L> {
 /// duplicates, so iterating it does not depend on how the e-graph stores anything.
 #[derive(Debug)]
 pub struct Changes<L: Language> {
-    nodes: HashMap<L::Discriminant, Vec<(Id, L)>>,
+    /// Unique among all change sets (see [`Changes::serial`]).
+    serial: u64,
+    /// Sorted by class, then node.
+    nodes: Vec<(Id, L)>,
+    /// For each operator, the positions in `nodes` of its e-nodes.
+    by_op: HashMap<L::Discriminant, Vec<usize>>,
     classes: Vec<Id>,
     data: Vec<Id>,
 }
 
 impl<L: Language> Changes<L> {
-    /// The e-nodes with operator `op` that are new to their e-class: added,
-    /// canonicalized again because a child was merged, or moved in by a union.
-    pub fn nodes(&self, op: &L::Discriminant) -> &[(Id, L)] {
-        self.nodes.get(op).map_or(&[], |nodes| nodes)
+    /// The e-nodes that are new to their e-class: added, canonicalized again
+    /// because a child was merged, or moved in by a union; as `(class, node)`.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &(Id, L)> {
+        self.nodes.iter()
+    }
+
+    /// The changed e-nodes (see [`iter`](Changes::iter)) with operator `op`.
+    pub fn nodes<'a>(&'a self, op: &L::Discriminant) -> impl Iterator<Item = &'a (Id, L)> {
+        let positions = self.by_op.get(op).map_or(&[][..], |p| p);
+        positions.iter().map(move |&i| &self.nodes[i])
     }
 
     /// The e-classes holding a changed e-node.
@@ -121,6 +135,12 @@ impl<L: Language> Changes<L> {
     /// The e-classes whose analysis data changed.
     pub fn data(&self) -> &[Id] {
         &self.data
+    }
+
+    /// A number no other change set has, so searchers can share what they derive
+    /// from this one (a rule set with many similar searchers walks the changes once).
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Whether nothing changed.
@@ -139,6 +159,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
                 base: 0,
                 entries: vec![],
                 seen: HashMap::default(),
+                trim_at: 0,
             })
         });
     }
@@ -201,25 +222,28 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let mut classes: Vec<Id> = nodes.iter().map(|(c, _)| *c).collect();
         classes.sort_unstable();
         classes.dedup();
-        let mut by_op: HashMap<L::Discriminant, Vec<(Id, L)>> = HashMap::default();
-        for (class, node) in nodes {
-            by_op
-                .entry(node.discriminant())
-                .or_default()
-                .push((class, node));
+        let mut by_op: HashMap<L::Discriminant, Vec<usize>> = HashMap::default();
+        for (i, (_, node)) in nodes.iter().enumerate() {
+            by_op.entry(node.discriminant()).or_default().push(i);
         }
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         Some(Changes {
-            nodes: by_op,
+            serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            nodes,
+            by_op,
             classes,
             data,
         })
     }
 
-    /// The classes holding an e-node that matches `path` (from the top) down to
-    /// `class`: each step is an operator (an e-node whose children are ignored) and
-    /// the child index the path descends through.
-    pub(crate) fn ancestors(&self, class: Id, path: &[(L, usize)]) -> Vec<Id> {
-        let mut level = vec![self.find(class)];
+    /// The classes holding an e-node that matches `path` (from the top) down to one
+    /// of `classes`: each step is an operator (an e-node whose children are
+    /// ignored) and the child index the path descends through.
+    pub(crate) fn ancestors(&self, mut classes: Vec<Id>, path: &[(L, usize)]) -> Vec<Id> {
+        classes.iter_mut().for_each(|c| *c = self.find(*c));
+        classes.sort_unstable();
+        classes.dedup();
+        let mut level = classes;
         for (op, i) in path.iter().rev() {
             let mut up = vec![];
             for &child in &level {
@@ -335,6 +359,8 @@ mod tests {
             "(+ (f ?x) ?y)",
             "(+ (f ?x) (f ?x))",
             "(+ ?x (+ ?y ?x))",
+            "(+ (f ?x) ?x)",
+            "(f (+ (f ?x) ?x))",
             "?x",
         ]
         .iter()
