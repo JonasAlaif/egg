@@ -85,12 +85,12 @@ impl std::fmt::Display for Id {
     }
 }
 
-pub(crate) use {explain::Explain, unionfind::UnionFind};
+pub(crate) use {eclass::ClassMap, explain::Explain, unionfind::UnionFind};
 
 pub use {
     dot::Dot,
     eclass::EClass,
-    egraph::{EGraph, LanguageMapper, SimpleLanguageMapper},
+    egraph::{Checkpoint, EGraph, LanguageMapper, SimpleLanguageMapper},
     explain::{
         Explanation, FlatExplanation, FlatTerm, Justification, TreeExplanation, TreeTerm,
         UnionEqualities,
