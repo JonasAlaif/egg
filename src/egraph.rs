@@ -72,6 +72,8 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     /// and classes borrowed mutably. Every other class still has canonical, sorted,
     /// deduplicated nodes and is listed in `classes_by_op` under exactly its
     /// operators, so a rebuild costs time in the size of these classes only.
+    /// Not in egg 0.11's format, so absent when loading a graph serialized by it.
+    #[cfg_attr(feature = "serde-1", serde(default))]
     dirty: Vec<Id>,
     /// For each class borrowed mutably since the last rebuild (the borrower may have
     /// changed its nodes), the operators `classes_by_op` lists it under.
@@ -1622,6 +1624,21 @@ mod tests {
             egraph.classes_for_op(&foo).unwrap().collect::<Vec<_>>(),
             [id]
         );
+    }
+
+    /// A graph serialized by egg 0.11, which has no `dirty` field, still loads.
+    #[cfg(all(feature = "serde-1", feature = "serde_json"))]
+    #[test]
+    fn egraph_without_dirty_field_deserializes() {
+        let mut egraph = EGraph::<SymbolLang, ()>::default();
+        egraph.add_expr(&"(foo bar baz)".parse().unwrap());
+        egraph.rebuild();
+        let mut json: serde_json::Value = serde_json::to_value(&egraph).unwrap();
+        json.as_object_mut().unwrap().remove("dirty").unwrap();
+
+        let mut egraph: EGraph<SymbolLang, ()> = serde_json::from_value(json).unwrap();
+        egraph.rebuild();
+        assert!(egraph.check_classes());
     }
 
     /// Rebuilds after rounds of adds and unions repair only the classes that changed;
