@@ -270,17 +270,6 @@ impl<L: Language, D> Trail<L, D> {
         self.log.push(Undo::Data { class, old });
     }
 
-    /// A copy of `data`, to record with [`Self::data_was`] once it is known to
-    /// have changed.
-    pub(crate) fn copy(&self, data: &D) -> D {
-        (self.clone_data)(data)
-    }
-
-    /// The analysis data of `class` was `old` (a copy made before a change).
-    pub(crate) fn data_was(&mut self, class: Id, old: D) {
-        self.log.push(Undo::Data { class, old });
-    }
-
     /// Records a union of `loser` into `root`, before the lists are concatenated.
     pub(crate) fn union(&mut self, root: &EClass<L, D>, loser: &EClass<L, D>) {
         self.data(root.id, &root.data);
@@ -329,11 +318,12 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// its state now, [`commit`](EGraph::commit) keeps the changes made since.
     /// Checkpoints nest; they are closed in the reverse order of opening.
     ///
-    /// The e-graph is [rebuilt](EGraph::rebuild) first. While a checkpoint is open
-    /// every change also records how to undo it, at a cost proportional to the
-    /// change (a mutable borrow of a class, through `egraph[id]` or
-    /// [`classes_mut`](EGraph::classes_mut), records the whole class, as the
-    /// borrower may change anything); with no checkpoint open nothing is recorded.
+    /// The e-graph is [rebuilt](EGraph::rebuild) first if any work is pending. While
+    /// a checkpoint is open every change also records how to undo it, at a cost
+    /// proportional to the change (a mutable borrow of a class, through
+    /// `egraph[id]` or [`classes_mut`](EGraph::classes_mut), records the whole
+    /// class, as the borrower may change anything); with no checkpoint open nothing
+    /// is recorded.
     /// State held by the [`Analysis`] value itself (rather than in the per-class
     /// data) is not restored.
     ///
@@ -366,10 +356,19 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             self.explain.is_none(),
             "checkpoints are not supported with explanations enabled"
         );
-        // Restore the invariants first, whatever is pending (a mutable borrow or
-        // `set_analysis_data` leaves work queued without clearing `clean`): the
-        // rollback restores this state and drops every queue.
-        self.rebuild();
+        // Restore the invariants first if anything is pending (a mutable borrow or
+        // `set_analysis_data` queues work without clearing `clean`): the rollback
+        // restores this state and drops every queue.
+        if !self.clean
+            || !self.pending.is_empty()
+            || !self.analysis_pending.is_empty()
+            || !self.dirty.is_empty()
+            || self.reindex_all
+        {
+            #[cfg(test)]
+            tests::CHECKPOINT_REBUILDS.with(|n| n.set(n.get() + 1));
+            self.rebuild();
+        }
         let size = self.unionfind.size();
         let frame = Frame {
             id: NEXT_FRAME.fetch_add(1, Ordering::Relaxed),
@@ -770,6 +769,67 @@ mod tests {
             g.rollback(checkpoint);
             assert_identical(&g, &reference);
         }
+    }
+
+    thread_local! {
+        /// How often `checkpoint` had to rebuild.
+        pub(super) static CHECKPOINT_REBUILDS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// `checkpoint` rebuilds only when work is pending: on a rebuilt e-graph it
+    /// costs nothing (a debug rebuild checks every class and memo entry).
+    #[test]
+    fn checkpoint_on_a_clean_egraph_does_not_rebuild() {
+        let mut g = G::default();
+        let x = g.add(Math::Symbol("x".into()));
+        g.rebuild();
+        let rebuilds = || CHECKPOINT_REBUILDS.with(|n| n.get());
+        let before = rebuilds();
+        let checkpoint = g.checkpoint();
+        g.rollback(checkpoint);
+        assert_eq!(rebuilds(), before);
+        g.set_analysis_data(x, Some(1));
+        let checkpoint = g.checkpoint();
+        g.commit(checkpoint);
+        assert_eq!(rebuilds(), before + 1);
+    }
+
+    /// Data a `merge` changes without reporting the change (e.g. a part of the
+    /// data its ordering ignores) is restored all the same.
+    #[test]
+    fn silent_merge_is_restored() {
+        #[derive(Default)]
+        struct Silent;
+        impl Analysis<Math> for Silent {
+            /// (value, a tag `merge` updates silently)
+            type Data = (Option<i32>, u32);
+            fn merge(&mut self, to: &mut Self::Data, from: Self::Data) -> DidMerge {
+                to.1 = to.1.max(from.1);
+                merge_max(&mut to.0, from.0)
+            }
+            fn make(egraph: &mut EGraph<Math, Self>, enode: &Math, _: Id) -> Self::Data {
+                match enode {
+                    Math::Num(n) => (Some(*n), 0),
+                    Math::Symbol(_) => (Some(5), 7),
+                    Math::F([a]) => (None, egraph[*a].data.1 + 1),
+                    _ => (None, 0),
+                }
+            }
+        }
+        let mut g = EGraph::<Math, Silent>::default();
+        let one = g.add(Math::Num(1));
+        let x = g.add(Math::Symbol("x".into()));
+        let f1 = g.add(Math::F([one]));
+        g.rebuild();
+        let before = (g[one].data, g[f1].data);
+        let checkpoint = g.checkpoint();
+        g.union(one, x);
+        g.rebuild();
+        // the parent's re-made data raised the tag without `merge` reporting it
+        assert_eq!(g[f1].data, (None, 8));
+        g.rollback(checkpoint);
+        assert_eq!((g[one].data, g[f1].data), before);
     }
 
     /// A token closed by an enclosing rollback cannot close the checkpoint that
