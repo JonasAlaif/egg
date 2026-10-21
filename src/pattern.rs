@@ -534,8 +534,9 @@ impl<L: Language, A: Analysis<L>> Searcher<L, A> for Pattern<L> {
             let eclass = group[0].0;
             let mut substs = vec![];
             for (_, node) in group {
-                substs.extend(self.program.run_at(egraph, eclass, Some(node), limit));
-                limit -= substs.len().min(limit);
+                let found = self.program.run_at(egraph, eclass, Some(node), limit);
+                limit -= found.len();
+                substs.extend(found);
             }
             if !substs.is_empty() {
                 let ast = Some(Cow::Borrowed(&self.ast));

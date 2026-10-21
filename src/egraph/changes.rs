@@ -197,13 +197,16 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// no-op if they are logged already. Without this the e-graph keeps no log
     /// and pays nothing.
     pub fn track_changes(&mut self) {
+        let in_checkpoint = self.trail.is_some();
         self.changes.get_or_insert_with(|| {
             Box::new(ChangeLog {
                 base: 0,
                 chunks: Default::default(),
                 tail: vec![],
                 seen: HashMap::default(),
-                pinned: None,
+                // started inside a checkpoint: a rollback to a checkpoint opened
+                // since may restore any position from the start
+                pinned: in_checkpoint.then_some(0),
             })
         });
     }
@@ -556,5 +559,50 @@ mod tests {
         g.rollback(checkpoint);
         assert_eq!(g.seen("a"), Some(seen));
         assert!(g.changes_since(seen).unwrap().is_empty());
+    }
+
+    /// A log started inside a checkpoint keeps what a rollback to a checkpoint
+    /// opened since may ask for again, however far a subscriber advanced.
+    #[test]
+    fn tracking_started_inside_a_checkpoint_survives_rollback() {
+        let mut g = G::default();
+        let outer = g.checkpoint();
+        g.track_changes();
+        let seen = g.change_pos().unwrap();
+        g.mark_seen("a", seen);
+        let inner = g.checkpoint();
+        for i in 0..3000 {
+            g.add(Math::Num(i));
+            g.rebuild();
+            let pos = g.change_pos().unwrap();
+            g.mark_seen("a", pos);
+        }
+        g.rollback(inner);
+        assert_eq!(g.seen("a"), Some(seen));
+        assert!(g.changes_since(seen).unwrap().is_empty());
+        g.rollback(outer);
+        assert!(g.change_pos().is_none());
+    }
+
+    /// The matches at several changed root e-nodes of one class count against
+    /// the limit one by one.
+    #[test]
+    fn search_changes_honours_the_limit_across_root_nodes() {
+        let mut g = G::default();
+        g.track_changes();
+        let x = g.add(Math::Symbol("x".into()));
+        let f = g.add(Math::F([x]));
+        g.rebuild();
+        let seen = g.change_pos().unwrap();
+        for s in ["a", "b", "c"] {
+            let y = g.add(Math::Symbol(s.into()));
+            let fy = g.add(Math::F([y]));
+            g.union(f, fy);
+        }
+        g.rebuild();
+        let changes = g.changes_since(seen).unwrap();
+        let pattern: Pattern<Math> = "(f ?x)".parse().unwrap();
+        let found = pattern.search_changes(&g, &changes, 3);
+        assert_eq!(found.iter().map(|m| m.substs.len()).sum::<usize>(), 3);
     }
 }
