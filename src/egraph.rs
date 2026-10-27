@@ -78,6 +78,8 @@ pub struct EGraph<L: Language, N: Analysis<L>> {
     #[cfg_attr(feature = "serde-1", serde(skip))]
     #[cfg_attr(feature = "serde-1", serde(default = "default_classes_by_op"))]
     classes_by_op: HashMap<L::Discriminant, HashSet<Id>>,
+    /// Every merge of two e-classes, in order, as `(new root, absorbed root)`.
+    union_log: Vec<(Id, Id)>,
     /// Whether or not reading operation are allowed on this e-graph.
     /// Mutating operations will set this to `false`, and
     /// [`EGraph::rebuild`] will set it to true.
@@ -122,6 +124,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             memo: Default::default(),
             analysis_pending: Default::default(),
             classes_by_op: Default::default(),
+            union_log: Default::default(),
         }
     }
 
@@ -149,6 +152,13 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     /// In normal circumstances, you should not need to use this.
     pub fn nodes(&self) -> &[L] {
         &self.nodes
+    }
+
+    /// Every merge of two e-classes so far, in order, as
+    /// `(new root, absorbed root)`. Both ids were canonical at the time of
+    /// the merge. No-op unions (already the same class) are not logged.
+    pub fn union_log(&self) -> &[(Id, Id)] {
+        &self.union_log
     }
 
     /// Returns `true` if the egraph is empty
@@ -634,6 +644,7 @@ where
                 .map(|x| self.map_node(x))
                 .collect(),
             analysis_pending: src_egraph.analysis_pending,
+            union_log: src_egraph.union_log,
             classes: src_egraph
                 .classes
                 .into_iter()
@@ -1166,6 +1177,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
 
         // make id1 the new root
         self.unionfind.union(id1, id2);
+        self.union_log.push((id1, id2));
 
         assert_ne!(id1, id2);
         let class2 = self.classes.remove(&id2).unwrap();
