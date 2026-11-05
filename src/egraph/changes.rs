@@ -48,8 +48,8 @@ pub(crate) struct ChangeLog<L> {
     chunks: std::collections::VecDeque<Arc<[Change<L>]>>,
     tail: Vec<Change<L>>,
     seen: HashMap<Symbol, usize>,
-    /// While a checkpoint is open: the lowest subscriber position when the
-    /// outermost one was opened. A rollback may restore any position since.
+    /// While a checkpoint is open: the lowest subscriber position since the
+    /// outermost one was opened. A rollback may restore any of them.
     pub(crate) pinned: Option<usize>,
 }
 
@@ -237,6 +237,9 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         );
         let subscriber = subscriber.into();
         let old = log.set_seen(subscriber, Some(pos.0));
+        if let Some(pinned) = &mut log.pinned {
+            *pinned = (*pinned).min(pos.0);
+        }
         if let Some(trail) = &mut *self.trail {
             trail.seen(subscriber, old);
         }
@@ -559,6 +562,46 @@ mod tests {
         g.rollback(checkpoint);
         assert_eq!(g.seen("a"), Some(seen));
         assert!(g.changes_since(seen).unwrap().is_empty());
+    }
+
+    /// A subscriber marked, inside a checkpoint, at a kept position below the pin;
+    /// an inner checkpoint opened then; the subscriber advances; a rollback to the
+    /// inner checkpoint restores the low position, which must still be kept.
+    #[test]
+    fn review_mark_below_pin_inside_checkpoint() {
+        let mut g = G::default();
+        g.track_changes();
+        g.mark_seen("a", g.change_pos().unwrap());
+        let mut early = None;
+        for i in 0..1500 {
+            g.add(Math::Num(i));
+            if i % 64 == 10 {
+                g.rebuild();
+                early = early.or(g.change_pos());
+            }
+        }
+        g.rebuild();
+        let early = early.unwrap();
+        g.mark_seen("a", g.change_pos().unwrap());
+        let _outer = g.checkpoint();
+        // still kept: the assertion in mark_seen accepts it
+        g.mark_seen("b", early);
+        let inner = g.checkpoint();
+        for i in 2000..6000 {
+            g.add(Math::Num(i));
+            if i % 64 == 0 {
+                g.rebuild();
+                let pos = g.change_pos().unwrap();
+                g.mark_seen("a", pos);
+                g.mark_seen("b", pos);
+            }
+        }
+        g.rollback(inner);
+        assert_eq!(g.seen("b"), Some(early));
+        assert!(
+            g.changes_since(early).is_some(),
+            "b's restored position is no longer kept"
+        );
     }
 
     /// A log started inside a checkpoint keeps what a rollback to a checkpoint
