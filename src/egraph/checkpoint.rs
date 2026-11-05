@@ -60,6 +60,7 @@ struct Frame {
     size: usize,
     log_len: usize,
     uf_log_len: usize,
+    union_log_len: usize,
 }
 
 /// Source of [`Frame::id`]s.
@@ -375,6 +376,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
             size,
             log_len: self.trail.as_ref().map_or(0, |t| t.log.len()),
             uf_log_len: self.unionfind.log_len(),
+            union_log_len: self.union_log.len(),
         };
         let trail = self.trail.get_or_insert_with(|| {
             Box::new(Trail {
@@ -465,6 +467,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
 
         let size = frame.size;
         self.unionfind.rollback(frame.uf_log_len, size);
+        self.union_log.truncate(frame.union_log_len);
         self.nodes.truncate(size);
         self.classes.truncate(size);
         self.pending.clear();
@@ -692,6 +695,7 @@ mod tests {
                         g.rollback(checkpoint);
                         ops.truncate(len);
                         assert_identical(&g, &snapshot);
+                        assert_eq!(g.union_log(), snapshot.union_log());
                         let mut fresh = G::default();
                         ops.iter().for_each(|op| apply(&mut fresh, op));
                         fresh.rebuild();
