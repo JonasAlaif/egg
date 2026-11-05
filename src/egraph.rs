@@ -167,6 +167,10 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
     }
 
     /// Returns an iterator over the eclasses that contain a given op.
+    ///
+    /// Between rebuilds, a union lists its surviving class under the merged class's
+    /// operators at once; a class created since the last rebuild is listed from the
+    /// next rebuild on.
     pub fn classes_for_op(
         &self,
         op: &L::Discriminant,
@@ -1260,9 +1264,23 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let class2 = self.classes.remove(&id2).unwrap();
         // `id2` no longer names a class. Unlisting an id the index never held (a class
         // created since the last rebuild) is a no-op.
-        match self.unindexed.remove(&id2) {
-            Some(ops) => unlist(&mut self.classes_by_op, id2, ops),
-            None => unlist(&mut self.classes_by_op, id2, distinct_ops(&class2.nodes)),
+        let id2_ops = self.unindexed.remove(&id2);
+        if let Some(ops) = &id2_ops {
+            unlist(&mut self.classes_by_op, id2, ops.iter().cloned());
+        }
+        // `id1` now holds `class2`'s nodes: list it under their operators right away,
+        // so that `classes_for_op` finds it before the next rebuild too.
+        let mut id1_ops = self.unindexed.get_mut(&id1);
+        for op in distinct_ops(&class2.nodes) {
+            let ids = self.classes_by_op.entry(op.clone()).or_default();
+            if id2_ops.is_none() {
+                ids.remove(&id2);
+            }
+            if ids.insert(id1) {
+                if let Some(ops) = &mut id1_ops {
+                    ops.push(op);
+                }
+            }
         }
         self.dirty.push(id1);
         let class1 = self.classes.get_mut(&id1).unwrap();
@@ -1730,5 +1748,43 @@ mod tests {
         egraph.rebuild();
         assert!(egraph.check_classes());
         assert_eq!(egraph.classes_for_op(&g).unwrap().len(), 0);
+    }
+
+    /// A union lists the surviving class under the merged class's operators at once,
+    /// so `classes_for_op` finds it before the next rebuild.
+    #[test]
+    fn union_lists_survivor_before_rebuild() {
+        use SymbolLang as S;
+
+        let mut egraph = EGraph::<S, ()>::default();
+        let x = egraph.add(S::leaf("x"));
+        let fx = egraph.add(S::new("f", vec![x]));
+        let gx = egraph.add(S::new("g", vec![x]));
+        egraph.rebuild();
+        egraph.union(fx, gx);
+        let root = egraph.find(fx);
+        for op in ["f", "g"] {
+            let op = S::new(op, vec![x]).discriminant();
+            let ids: Vec<_> = egraph.classes_for_op(&op).unwrap().collect();
+            assert_eq!(ids, [root]);
+        }
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+
+        // The survivor is borrowed mutably before the union, and the borrower then
+        // drops the node the union brought in: the next rebuild must unlist the
+        // survivor from that node's operator.
+        let hx = egraph.add(S::new("h", vec![x]));
+        egraph.rebuild();
+        let _ = &mut egraph[root];
+        egraph.union(root, hx);
+        assert_eq!(egraph.find(hx), root);
+        let h = S::new("h", vec![x]).discriminant();
+        let ids: Vec<_> = egraph.classes_for_op(&h).unwrap().collect();
+        assert_eq!(ids, [root]);
+        egraph[root].nodes.retain(|n| n.op != "h".into());
+        egraph.rebuild();
+        assert!(egraph.check_classes());
+        assert_eq!(egraph.classes_for_op(&h).unwrap().len(), 0);
     }
 }
