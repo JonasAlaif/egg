@@ -151,6 +151,8 @@ pub struct Changes<L: Language> {
     serial: u64,
     /// Sorted by class, then node.
     nodes: Vec<(Id, L)>,
+    /// Per entry of `nodes`: whether a union only moved that e-node into its class.
+    moved: Vec<bool>,
     /// For each operator, the positions in `nodes` of its e-nodes.
     by_op: HashMap<L::Discriminant, Vec<usize>>,
     classes: Vec<Id>,
@@ -168,6 +170,18 @@ impl<L: Language> Changes<L> {
     pub fn nodes<'a>(&'a self, op: &L::Discriminant) -> impl Iterator<Item = &'a (Id, L)> {
         let positions = self.by_op.get(op).map_or(&[][..], |p| p);
         positions.iter().map(move |&i| &self.nodes[i])
+    }
+
+    /// The changed e-nodes with operator `op` other than those a union only moved
+    /// into another e-class: e-nodes added, or canonicalized again because a child
+    /// was merged. A match rooted at a moved e-node existed before at the class it
+    /// came from, which the union merged, so only matches above it can be new.
+    pub fn added<'a>(&'a self, op: &L::Discriminant) -> impl Iterator<Item = &'a (Id, L)> {
+        let positions = self.by_op.get(op).map_or(&[][..], |p| p);
+        positions
+            .iter()
+            .filter(move |&&i| !self.moved[i])
+            .map(move |&i| &self.nodes[i])
     }
 
     /// The e-classes holding a changed e-node.
@@ -267,24 +281,32 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         let log = self.changes.as_ref()?;
         let entries = log.since(pos.0)?;
         let canonical = |node: &L| node.clone().map_children(|c| self.find(c));
-        let mut nodes: Vec<(Id, L)> = vec![];
+        // `(class, node, moved)`; an e-node logged both as moved and otherwise is not
+        // only moved
+        let mut logged: Vec<(Id, L, bool)> = vec![];
         let mut data = vec![];
         for change in entries {
             match change {
-                Change::Node(id) => {
-                    nodes.push((self.find(*id), canonical(&self.nodes[usize::from(*id)])))
-                }
-                Change::Moved(id, node) => nodes.push((self.find(*id), canonical(node))),
+                Change::Node(id) => logged.push((
+                    self.find(*id),
+                    canonical(&self.nodes[usize::from(*id)]),
+                    false,
+                )),
+                Change::Moved(id, node) => logged.push((self.find(*id), canonical(node), true)),
                 Change::Data(id) => data.push(self.find(*id)),
                 Change::Class(id) => {
                     let id = self.find(*id);
-                    nodes.extend(self[id].nodes.iter().map(|n| (id, n.clone())));
+                    logged.extend(self[id].nodes.iter().map(|n| (id, n.clone(), false)));
                     data.push(id);
                 }
             }
         }
-        nodes.sort_unstable();
-        nodes.dedup();
+        logged.sort_unstable();
+        logged.dedup_by(|b, a| a.0 == b.0 && a.1 == b.1);
+        let (nodes, moved): (Vec<(Id, L)>, Vec<bool>) = logged
+            .into_iter()
+            .map(|(class, node, moved)| ((class, node), moved))
+            .unzip();
         data.sort_unstable();
         data.dedup();
         let mut classes: Vec<Id> = nodes.iter().map(|(c, _)| *c).collect();
@@ -298,6 +320,7 @@ impl<L: Language, N: Analysis<L>> EGraph<L, N> {
         Some(Changes {
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             nodes,
+            moved,
             by_op,
             classes,
             data,
@@ -531,6 +554,42 @@ mod tests {
         );
         // and the search must actually be incremental
         assert!(incremental * 3 < full, "{} of {}", incremental, full);
+    }
+
+    /// `Changes::added` leaves out an e-node a union only moved, and keeps one that
+    /// was also added or canonicalized again since.
+    #[test]
+    fn added_excludes_nodes_only_moved() {
+        let mut g = G::default();
+        g.track_changes();
+        let (a, b) = (
+            g.add(Math::Symbol("a".into())),
+            g.add(Math::Symbol("b".into())),
+        );
+        let (fa, fb) = (g.add(Math::F([a])), g.add(Math::F([b])));
+        let x = g.add(Math::Symbol("x".into()));
+        // a parent keeps `x`'s class the survivor of the union below
+        g.add(Math::F([x]));
+        g.rebuild();
+        let f = Math::F([Id::from(0)]).discriminant();
+        // `f(a)` moves into `x`'s class
+        let pos = g.change_pos().unwrap();
+        g.mark_seen("s", pos);
+        g.union(fa, x);
+        g.rebuild();
+        assert_eq!(g.find(fa), x);
+        let changes = g.changes_since(pos).unwrap();
+        assert_eq!(changes.nodes(&f).count(), 1);
+        assert_eq!(changes.added(&f).count(), 0);
+        // merging `a` and `b` canonicalizes `f(a)` or `f(b)` again
+        let pos = g.change_pos().unwrap();
+        g.mark_seen("s", pos);
+        g.union(a, b);
+        g.rebuild();
+        let changes = g.changes_since(pos).unwrap();
+        assert_eq!(g.find(fa), g.find(fb));
+        assert_eq!(changes.added(&f).count(), 1);
+        assert_eq!(changes.nodes(&f).count(), 1);
     }
 
     /// Changes every subscriber has consumed are forgotten, and changes a rollback
