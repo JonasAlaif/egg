@@ -1787,4 +1787,93 @@ mod tests {
         assert!(egraph.check_classes());
         assert_eq!(egraph.classes_for_op(&h).unwrap().len(), 0);
     }
+
+    /// `classes_for_op` between rebuilds, over random adds, unions and rebuilds:
+    /// every listed id is a canonical class holding a node with that operator;
+    /// every class is listed under the operator of each of its nodes, except a
+    /// class created since the last rebuild under its own node's operator; and
+    /// every class listed at the last rebuild resolves to a listed class.
+    #[test]
+    fn classes_for_op_between_rebuilds_randomized() {
+        use SymbolLang as S;
+
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 >> 12;
+                self.0 ^= self.0 << 25;
+                self.0 ^= self.0 >> 27;
+                (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n as u64) as usize
+            }
+        }
+        let listed = |g: &EGraph<S, ()>, op: &<S as Language>::Discriminant| -> Vec<Id> {
+            g.classes_for_op(op)
+                .map(|i| i.collect())
+                .unwrap_or_default()
+        };
+        let mut ops = vec![];
+        for op in ["f", "g", "h", "k", "x0", "x1", "x2", "x3", "x4", "x5"] {
+            for arity in 0..3 {
+                ops.push(S::new(op, vec![Id::from(0); arity]).discriminant());
+            }
+        }
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut g = EGraph::<S, ()>::default();
+            for i in 0..6 {
+                g.add(S::leaf(format!("x{i}")));
+            }
+            g.rebuild();
+            let snapshot = |g: &EGraph<S, ()>| -> Vec<Vec<Id>> {
+                ops.iter().map(|op| listed(g, op)).collect()
+            };
+            let (mut size_at_rebuild, mut at_rebuild) = (g.nodes.len(), snapshot(&g));
+            for _ in 0..150 {
+                let n = g.nodes.len();
+                match rng.below(10) {
+                    0..=3 => {
+                        let op = ["f", "g", "h", "k"][rng.below(4)];
+                        let children = (0..1 + rng.below(2))
+                            .map(|_| Id::from(rng.below(n)))
+                            .collect();
+                        g.add(S::new(op, children));
+                    }
+                    4..=7 => {
+                        let (a, b) = (Id::from(rng.below(n)), Id::from(rng.below(n)));
+                        g.union(a, b);
+                    }
+                    _ => {
+                        g.rebuild();
+                        (size_at_rebuild, at_rebuild) = (g.nodes.len(), snapshot(&g));
+                    }
+                }
+                for op in &ops {
+                    for c in listed(&g, op) {
+                        assert_eq!(g.find(c), c, "seed {seed}");
+                        assert!(g[c].nodes.iter().any(|n| n.discriminant() == *op));
+                    }
+                }
+                for class in g.classes() {
+                    for node in &class.nodes {
+                        let op = node.discriminant();
+                        let own = usize::from(class.id) >= size_at_rebuild
+                            && g.id_to_node(class.id).discriminant() == op;
+                        assert!(
+                            own || listed(&g, &op).contains(&class.id),
+                            "seed {seed}: {} not listed under {node:?}",
+                            class.id
+                        );
+                    }
+                }
+                for (op, ids) in ops.iter().zip(&at_rebuild) {
+                    let now = listed(&g, op);
+                    for &c in ids {
+                        assert!(now.contains(&g.find(c)), "seed {seed}: lost {c}");
+                    }
+                }
+            }
+            g.rebuild();
+            assert!(g.check_classes());
+        }
+    }
 }
