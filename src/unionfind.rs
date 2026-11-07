@@ -1,13 +1,75 @@
 use crate::Id;
 use std::fmt::Debug;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 #[cfg_attr(feature = "serde-1", derive(serde::Serialize, serde::Deserialize))]
 pub struct UnionFind {
     parents: Vec<Id>,
+    /// While a checkpoint is open: the previous parent of every overwritten entry
+    /// below `logged_below` (entries at or above it are discarded by a rollback).
+    #[cfg_attr(feature = "serde-1", serde(skip))]
+    undo: Vec<(Id, Id)>,
+    #[cfg_attr(feature = "serde-1", serde(skip))]
+    logged_below: usize,
+}
+
+/// A clone records nothing: checkpoints belong to the e-graph they were opened on.
+impl Clone for UnionFind {
+    fn clone(&self) -> Self {
+        UnionFind {
+            parents: self.parents.clone(),
+            undo: Vec::new(),
+            logged_below: 0,
+        }
+    }
 }
 
 impl UnionFind {
+    /// This union-find, recording nothing.
+    pub(crate) fn without_log(mut self) -> Self {
+        self.clear_log();
+        self
+    }
+
+    /// Records overwrites of the entries that exist now, until the next call;
+    /// `0` stops recording.
+    pub(crate) fn log_writes_below(&mut self, len: usize) {
+        self.logged_below = len;
+    }
+
+    /// The length of the overwrite log, a position to [`rollback`](Self::rollback) to.
+    pub(crate) fn log_len(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Undoes the overwrites recorded since `log_len`, then forgets the sets made
+    /// after the first `size` ones.
+    pub(crate) fn rollback(&mut self, log_len: usize, size: usize) {
+        for (id, parent) in self.undo.drain(log_len..).rev() {
+            self.parents[usize::from(id)] = parent;
+        }
+        self.parents.truncate(size);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parents(&self) -> &[Id] {
+        &self.parents
+    }
+
+    /// Forgets the overwrite log (no checkpoint is open any more).
+    pub(crate) fn clear_log(&mut self) {
+        self.undo.clear();
+        self.logged_below = 0;
+    }
+
+    fn set_parent(&mut self, query: Id, parent: Id) {
+        let slot = &mut self.parents[usize::from(query)];
+        if usize::from(query) < self.logged_below {
+            self.undo.push((query, *slot));
+        }
+        *slot = parent;
+    }
+
     pub fn make_set(&mut self) -> Id {
         let id = Id::from(self.parents.len());
         self.parents.push(id);
@@ -22,10 +84,6 @@ impl UnionFind {
         self.parents[usize::from(query)]
     }
 
-    fn parent_mut(&mut self, query: Id) -> &mut Id {
-        &mut self.parents[usize::from(query)]
-    }
-
     pub fn find(&self, mut current: Id) -> Id {
         while current != self.parent(current) {
             current = self.parent(current)
@@ -36,7 +94,7 @@ impl UnionFind {
     pub fn find_mut(&mut self, mut current: Id) -> Id {
         while current != self.parent(current) {
             let grandparent = self.parent(self.parent(current));
-            *self.parent_mut(current) = grandparent;
+            self.set_parent(current, grandparent);
             current = grandparent;
         }
         current
@@ -44,7 +102,7 @@ impl UnionFind {
 
     /// Given two leader ids, unions the two eclasses making root1 the leader.
     pub fn union(&mut self, root1: Id, root2: Id) -> Id {
-        *self.parent_mut(root2) = root1;
+        self.set_parent(root2, root1);
         root1
     }
 }
