@@ -174,8 +174,12 @@ impl<L: Language> Changes<L> {
 
     /// The changed e-nodes with operator `op` other than those a union only moved
     /// into another e-class: e-nodes added, or canonicalized again because a child
-    /// was merged. A match rooted at a moved e-node existed before at the class it
-    /// came from, which the union merged, so only matches above it can be new.
+    /// was merged. A flat pattern (one operator over variables) rooted at a moved
+    /// e-node matched it before at the class it came from, which the union merged,
+    /// so only matches above it can be new. A deeper pattern rooted there can still
+    /// match anew: a child class may have absorbed another one and kept its id, which
+    /// leaves the e-node as it was, so such a search must also look at what changed
+    /// below the root.
     pub fn added<'a>(&'a self, op: &L::Discriminant) -> impl Iterator<Item = &'a (Id, L)> {
         let positions = self.by_op.get(op).map_or(&[][..], |p| p);
         positions
@@ -556,6 +560,114 @@ mod tests {
         assert!(incremental * 3 < full, "{} of {}", incremental, full);
     }
 
+    /// A flat searcher reading only `Changes::added` misses no match a full scan
+    /// finds, under random adds, adds merged away in the same window, unions, data
+    /// edits, rebuilds, nested checkpoints, commits and rollbacks.
+    #[test]
+    fn added_flat_search_complete() {
+        let name = Symbol::from("flat");
+        let (mut rollbacks, mut excluded) = (0, 0usize);
+        let flat_all = |g: &G| -> Vec<(Id, Math)> {
+            let mut v = vec![];
+            for c in g.classes() {
+                for n in &c.nodes {
+                    if matches!(n, Math::F(_) | Math::Add(_)) {
+                        v.push((c.id, n.clone().map_children(|x| g.find(x))));
+                    }
+                }
+            }
+            v
+        };
+        for seed in 1..=400u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut g = G::default();
+            g.track_changes();
+            g.add(Math::Num(0));
+            let mut reported: Vec<(Id, Math)> = vec![];
+            let mut open: Vec<(Checkpoint, Vec<(Id, Math)>)> = vec![];
+            for _ in 0..150 {
+                let id = |rng: &mut Rng, g: &G| Id::from(rng.below(g.nodes.len()));
+                match rng.below(14) {
+                    0..=1 => {
+                        g.add(Math::Num(rng.below(4) as i32));
+                    }
+                    2 => {
+                        g.add(Math::Symbol(format!("x{}", rng.below(10)).into()));
+                    }
+                    3..=4 => {
+                        let x = id(&mut rng, &g);
+                        g.add(Math::F([x]));
+                    }
+                    5 => {
+                        let (x, y) = (id(&mut rng, &g), id(&mut rng, &g));
+                        g.add(Math::Add([x, y]));
+                    }
+                    6 => {
+                        // add a node and merge it away in the same window
+                        let x = id(&mut rng, &g);
+                        let n = g.add(Math::F([x]));
+                        let y = id(&mut rng, &g);
+                        g.union(n, y);
+                    }
+                    7 => {
+                        let (x, y) = (id(&mut rng, &g), id(&mut rng, &g));
+                        g.union(x, y);
+                    }
+                    8 => {
+                        let x = id(&mut rng, &g);
+                        g[x].data = None;
+                    }
+                    9 if open.len() < 3 => {
+                        let checkpoint = g.checkpoint();
+                        open.push((checkpoint, reported.clone()));
+                    }
+                    10 if !open.is_empty() => {
+                        let (checkpoint, before) = open.pop().unwrap();
+                        g.rollback(checkpoint);
+                        reported = before;
+                        rollbacks += 1;
+                    }
+                    11 if !open.is_empty() => {
+                        let (checkpoint, _) = open.pop().unwrap();
+                        g.commit(checkpoint);
+                    }
+                    _ => {
+                        g.rebuild();
+                        let pos = g.change_pos().unwrap();
+                        match g.seen(name) {
+                            Some(seen) => {
+                                let changes = g.changes_since(seen).unwrap();
+                                for op in [
+                                    Math::F([Id::from(0)]).discriminant(),
+                                    Math::Add([Id::from(0), Id::from(0)]).discriminant(),
+                                ] {
+                                    excluded +=
+                                        changes.nodes(&op).count() - changes.added(&op).count();
+                                    reported.extend(changes.added(&op).cloned());
+                                }
+                            }
+                            None => reported = flat_all(&g),
+                        }
+                        let known: HashSet<(Id, Math)> = reported
+                            .iter()
+                            .map(|(c, n)| (g.find(*c), n.clone().map_children(|x| g.find(x))))
+                            .collect();
+                        for m in flat_all(&g) {
+                            assert!(known.contains(&m), "seed {}: missed {:?}", seed, m);
+                        }
+                        g.mark_seen(name, pos);
+                    }
+                }
+            }
+        }
+        assert!(
+            rollbacks > 100 && excluded > 100,
+            "{} {}",
+            rollbacks,
+            excluded
+        );
+    }
+
     /// `Changes::added` leaves out an e-node a union only moved, and keeps one that
     /// was also added or canonicalized again since.
     #[test]
@@ -627,7 +739,7 @@ mod tests {
     /// an inner checkpoint opened then; the subscriber advances; a rollback to the
     /// inner checkpoint restores the low position, which must still be kept.
     #[test]
-    fn review_mark_below_pin_inside_checkpoint() {
+    fn mark_below_pin_inside_checkpoint() {
         let mut g = G::default();
         g.track_changes();
         g.mark_seen("a", g.change_pos().unwrap());
